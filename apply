@@ -171,27 +171,32 @@ register() { # load layouts.lua; Hyprland rejects a repeat registration
 }
 
 send_preset() { # send_preset <name> -- switch the live shape
-  # The loaded layout keeps the preset in its own state and a layout message is
-  # the only channel that reaches it. Messages go to the *focused* workspace's
-  # layout, so if the focused workspace is not using ours, borrow it for the
-  # message and hand it straight back.
+  # The preset lives inside the loaded layout and a layout message is the only
+  # channel that reaches it. Messages go to the *focused* workspace's layout, so
+  # when the focused workspace is not using ours it is borrowed for the message
+  # and then genuinely re-tiled back: returning it with a same-value rule
+  # assignment leaves it showing our geometry while reporting dwindle, which is
+  # worse than not borrowing at all.
   #
   # `hyprctl eval` is not an option here: it neither returns values nor shares
   # globals with the loaded layout, so it cannot reach the provider at all.
-  local name="$1" ws previous borrowed=0 out status
+  local name="$1" ws previous out status
   ws="$(active_workspace)"
   previous="$(active_layout)"
 
   if ws_ok "$ws" && [[ $previous != "$LAYOUT" ]]; then
     rule_for "$ws" "$LAYOUT"
-    borrowed=1
+    sleep "$SETTLE"
   fi
 
   out="$(hyprctl dispatch "hl.dsp.layout(\"$name\")" 2>&1)" && status=0 || status=$?
 
-  if ((borrowed == 1)); then
-    rule_for "$ws" "${previous:-dwindle}"
-    log "borrowed workspace $ws for the layout message and handed it back to ${previous:-dwindle}"
+  if ws_ok "$ws" && [[ $previous != "$LAYOUT" ]]; then
+    if force_retile "$ws" "${previous:-dwindle}"; then
+      log "borrowed workspace $ws for the layout message and re-tiled it back to ${previous:-dwindle}"
+    else
+      log "borrowed workspace $ws for the layout message; it reports ${previous:-dwindle} but its windows may need Reapply"
+    fi
   fi
 
   if ((status != 0)); then
@@ -203,6 +208,16 @@ rule_for() { # rule_for <workspace> <layout> -- set the workspace rule
   local ws="$1" layout="$2" out status
   out="$(hypr_eval "hl.workspace_rule({ workspace = \"$ws\", layout = \"$layout\" })")" && status=0 || status=$?
   ((status == 0)) || fail 3 "Hyprland rejected the workspace rule: $(printf '%s' "$out" | head -n 1)"
+}
+
+resolve_ws() { # resolve_ws <arg> -> a workspace id, resolving 'current' at call time
+  # The bar widget's idea of the focused workspace goes stale the moment you
+  # move, so panel actions pass 'current', which is resolved here, now.
+  local arg="${1:-}"
+  case "$arg" in
+    "" | current | ".") active_workspace ;;
+    *) printf '%s' "$arg" ;;
+  esac
 }
 
 workspace_layout() { # workspace_layout <id> -> its tiledLayout, or empty
@@ -239,16 +254,46 @@ verify_workspace() { # catches a layout name that resolves to something else
   fail 4 "layout did not resolve: asked for $want, Hyprland reports $got.${hint}"
 }
 
-force_retile() { # force_retile <workspace> -- make an active workspace re-run its layout
+# Hyprland applies a workspace rule and re-runs the layout asynchronously. Two
+# back-to-back evals coalesce into no net change, so every rule flip needs a
+# pause between the two assignments or the compositor never recalculates.
+SETTLE="${CENTRE_SPLIT_SETTLE:-0.35}"
+
+geometry_signature() { # geometry_signature <workspace> -- what is actually on screen
+  hyprctl clients -j 2>/dev/null \
+    | jq -r --argjson ws "$1" \
+      '[.[] | select(.workspace.id == $ws) | "\(.at[0]),\(.at[1]),\(.size[0]),\(.size[1])"] | sort | join(" ")' \
+      2>/dev/null || true
+}
+
+force_retile() { # force_retile <workspace> <final-layout> -- make it re-run its layout
   # Setting a workspace rule to the value it already has is a no-op, so the
-  # compositor never recalculates and a preset change would not show until the
-  # next window opens there. Flipping the rule through dwindle and back is a
-  # real change each time, so Hyprland re-tiles at once.
-  local ws="$1"
+  # compositor never recalculates: that is how a workspace ends up reporting one
+  # layout while its windows still hold another one's geometry. Flip through a
+  # different layout with a pause either side and check the windows actually
+  # moved, because two back-to-back evals coalesce into no net change.
+  local ws="$1" final="$2" inter before mid attempt
   ws_ok "$ws" || return 1
-  rule_for "$ws" "dwindle"
-  rule_for "$ws" "$LAYOUT"
-  return 0
+  if [[ $final == "$LAYOUT" ]]; then inter="dwindle"; else inter="$LAYOUT"; fi
+
+  for attempt in 1 2; do
+    if ((attempt == 2)); then inter="master"; fi   # a different intermediate
+    before="$(geometry_signature "$ws")"
+    rule_for "$ws" "$inter"
+    sleep "$SETTLE"
+    mid="$(geometry_signature "$ws")"
+    rule_for "$ws" "$final"
+    sleep "$SETTLE"
+
+    # Movement mid-flip is the proof the compositor re-ran the layout.
+    if [[ -z $before || $before != "$mid" ]]; then
+      return 0
+    fi
+    log "workspace $ws did not move through $inter; retrying through master"
+  done
+
+  log "WARNING workspace $ws did not re-tile; its windows may be showing the previous layout"
+  return 1
 }
 
 retile_saved() { # re-apply saved rules so a preset change shows immediately
@@ -258,7 +303,7 @@ retile_saved() { # re-apply saved rules so a preset change shows immediately
     ws_ok "$ws" || continue
     layout_ok "$layout" || continue
     if [[ $layout == "$LAYOUT" ]]; then
-      force_retile "$ws" && count=$((count + 1))
+      force_retile "$ws" "$LAYOUT" && count=$((count + 1))
     elif hypr_eval "hl.workspace_rule({ workspace = \"$ws\", layout = \"$layout\" })" >/dev/null; then
       count=$((count + 1))
     fi
@@ -269,7 +314,7 @@ retile_saved() { # re-apply saved rules so a preset change shows immediately
   local current_ws
   current_ws="$(active_workspace)"
   if ws_ok "$current_ws" && [[ "$(active_layout)" == "$LAYOUT" ]]; then
-    force_retile "$current_ws" && count=$((count + 1))
+    force_retile "$current_ws" "$LAYOUT" && count=$((count + 1))
   fi
   printf '%s' "$count"
 }
@@ -292,20 +337,41 @@ cmd_register() {
   jq -n --arg preset "$preset" '{ok: true, registered: true, preset: $preset}'
 }
 
-cmd_apply() { # apply <workspace> [preset]
+cmd_apply() { # apply <workspace|current> [preset]
   local ws="${1:-}" preset="${2:-}"
-  ws_ok "$ws" || fail 1 "workspace must be a positive integer (got '${ws}')"
+  ws="$(resolve_ws "$ws")"
+  ws_ok "$ws" || fail 1 "workspace must be a positive integer or 'current' (got '${1:-}')"
   [[ -z $preset ]] || preset_ok "$preset" || fail 1 "unknown preset: '${preset}'"
   register
+
+  # Order matters. Give the workspace our layout first, so the preset message
+  # (which only reaches the focused workspace's layout) lands on this workspace
+  # when it is the one the user is looking at, instead of borrowing a stranger.
+  local prev_layout
+  prev_layout="$(workspace_layout "$ws")"
+  rule_for "$ws" "$LAYOUT"
+  sleep "$SETTLE"
+
   if [[ -n $preset ]]; then
     send_preset "$preset"
     write_state '.preset = $preset' --arg preset "$preset"
+    sleep "$SETTLE"
   fi
-  rule_for "$ws" "$LAYOUT"
-  force_retile "$ws"
+
   write_state '.workspaces = ((.workspaces // {}) + {($ws): $layout})' \
     --arg ws "$ws" --arg layout "$LAYOUT"
   write_omarchy_restore "$ws" "$LAYOUT"
+
+  # A rule assignment equal to what the workspace already reported is a no-op,
+  # so the compositor never recalculated and any windows already there are still
+  # in the old shape.
+  if [[ $prev_layout == "$LAYOUT" ]]; then
+    if ! force_retile "$ws" "$LAYOUT"; then
+      VERIFY_NOTE="workspace $ws kept its previous window geometry; open or close a window there, or use Reapply"
+      log "$VERIFY_NOTE"
+    fi
+  fi
+
   verify_workspace "$ws" "$LAYOUT"
   if [[ -n $preset ]]; then
     retile_saved >/dev/null
@@ -314,11 +380,22 @@ cmd_apply() { # apply <workspace> [preset]
   notify low "Centre split" "$(preset_label "$(saved_preset)") · workspace $ws"
 }
 
-cmd_release() { # release <workspace>
-  local ws="${1:-}"
-  ws_ok "$ws" || fail 1 "workspace must be a positive integer (got '${ws}')"
+cmd_release() { # release <workspace|current>
+  local ws="${1:-}" prev_layout
+  ws="$(resolve_ws "$ws")"
+  ws_ok "$ws" || fail 1 "workspace must be a positive integer or 'current' (got '${1:-}')"
   register
+  prev_layout="$(workspace_layout "$ws")"
   rule_for "$ws" "dwindle"
+  sleep "$SETTLE"
+  # Same trap in reverse: a workspace that already reported dwindle keeps
+  # whatever geometry it had been left in.
+  if [[ $prev_layout == "dwindle" ]]; then
+    if ! force_retile "$ws" "dwindle"; then
+      VERIFY_NOTE="workspace $ws kept its previous window geometry; open or close a window there, or use Reapply"
+      log "$VERIFY_NOTE"
+    fi
+  fi
   write_state '.workspaces = ((.workspaces // {}) | del(.[$ws]))' --arg ws "$ws"
   remove_omarchy_restore "$ws"
   result_json "$ws" "dwindle"
@@ -486,8 +563,8 @@ usage() {
   cat >&2 <<'USAGE'
 usage: apply <command>
   register                       load layouts.lua into Hyprland and set the preset
-  apply <workspace> [preset]     split a workspace, then verify the result
-  release <workspace>            hand a workspace back to dwindle
+  apply <workspace|current> [preset]  split a workspace, then verify the result
+  release <workspace|current>    hand a workspace back to dwindle
   preset <name>                  switch the shape everywhere the split is on
   default [preset]               make the split Hyprland's default layout
   restore                        re-apply saved choices (shell start, after reload)

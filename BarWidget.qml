@@ -19,6 +19,7 @@ BarWidget {
   property string lastEvent: ""
   property string lastEventAt: ""
   property var callback: null
+  property var pendingArgs: null
 
   readonly property string omarchyPath: Quickshell.env("OMARCHY_PATH") || "/usr/share/omarchy"
   readonly property string helperPath: Qt.resolvedUrl("apply").toString().replace(/^file:\/\//, "")
@@ -46,7 +47,11 @@ BarWidget {
 
   function runHelper(args, onDone) {
     if (root.busy) {
-      root.logEvent("busy", "ignored: " + args.join(" "))
+      // The helper takes a couple of seconds (it pauses while Hyprland settles
+      // each rule change). Queue the newest request instead of dropping the
+      // click that caused it.
+      root.pendingArgs = args
+      root.logEvent("queued", args.join(" "))
       return false
     }
     root.busy = true
@@ -61,25 +66,37 @@ BarWidget {
   }
 
   function applyToWorkspace(workspace, preset) {
-    var ws = Number(workspace) || root.workspaceId
-    if (ws < 1) {
+    // "current" is resolved by the helper at call time: the widget's cached
+    // workspace id goes stale the moment you switch workspaces, and acting on
+    // a stale id splits a workspace you are not even looking at.
+    var ws = (workspace === undefined || workspace === null || workspace === ""
+              || workspace === "current") ? "current" : String(Number(workspace) || 0)
+    if (ws === "0") {
       root.lastError = "No workspace to split"
       root.logEvent("apply-skipped", "no workspace")
       return
     }
-    var args = ["apply", String(ws)]
+    var args = ["apply", ws]
     if (preset !== undefined && preset !== "") args.push(String(preset))
     root.runHelper(args)
   }
 
-  function setPreset(name) {
+  function applyShape(preset) {
+    // Picking a shape means "give this workspace that shape": applying it to the
+    // focused workspace is also what lets the preset message reach the layout,
+    // because messages only go to the focused workspace's layout.
+    root.applyToWorkspace("current", preset)
+  }
+
+  function setPresetEverywhere(name) {
     root.runHelper(["preset", String(name)])
   }
 
   function releaseWorkspace(workspace) {
-    var ws = Number(workspace) || root.workspaceId
-    if (ws < 1) return
-    root.runHelper(["release", String(ws)])
+    var ws = (workspace === undefined || workspace === null || workspace === ""
+              || workspace === "current") ? "current" : String(Number(workspace) || 0)
+    if (ws === "0") return
+    root.runHelper(["release", ws])
   }
 
   function setDefault(preset) {
@@ -198,6 +215,15 @@ BarWidget {
         var fn = root.callback
         root.callback = null
         fn(code)
+      }
+      if (root.pendingArgs) {
+        var queued = root.pendingArgs
+        root.pendingArgs = null
+        root.logEvent("running-queued", queued.join(" "))
+        actionProcess.command = [root.helperPath].concat(queued)
+        root.busy = true
+        actionProcess.running = true
+        return
       }
       root.refresh()
     }

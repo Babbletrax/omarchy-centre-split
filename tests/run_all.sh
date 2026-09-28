@@ -37,3 +37,7 @@ fi
 
 echo "== live geometry on a scratch workspace =="
 python3 "$REPO/tests/visual_test.py" "${SHOT_ARGS[@]+"${SHOT_ARGS[@]}"}"
+echo
+
+echo "== click path over IPC (the way the panel drives it) =="
+bash "$REPO/tests/click_path.sh"

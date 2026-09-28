@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.babbletrax.centre-split",
   "name": "Centre Split",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Babbletrax",
   "license": "MIT",
   "description": "Three-window tiling with the half in the centre: 1/4 · 1/2 · 1/4. Also even, thirds, and 50/50.",

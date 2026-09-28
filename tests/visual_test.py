@@ -93,6 +93,23 @@ CASES = [
         "why": "plain 50/50",
         "expect": [(0, 0, 1), (1, 0, 1)],
     },
+    {
+        "name": "resplit-after-release",
+        "preset": "qhq",
+        "windows": 4,
+        "why": "splitting again a workspace that had the split, was handed back, and kept its windows",
+        "pre": [["apply", "<ws>", "qhq"], ["release", "<ws>"]],
+        "expect": [(1, 0, 2), (0, 0, 1), (2, 0, 1), (1, 1, 2)],
+    },
+    {
+        "name": "switch-shape-live",
+        "preset": "qhq",
+        "expect_preset": "thirds",
+        "windows": 3,
+        "why": "switching the shape re-tiles every window already on a split workspace",
+        "switch": [["preset", "thirds"]],
+        "expect": [(0, 0, 1), (1, 0, 1), (2, 0, 1)],
+    },
 ]
 
 
@@ -132,13 +149,16 @@ def monitor_for_client(client: dict) -> dict:
 
 
 def usable_area(monitor: dict) -> tuple[int, int, int, int]:
-    """Monitor work area: position and size minus the bar's reserved strip."""
+    """Monitor work area: position and size minus the bar's reserved strip.
+
+    Hyprland reports `reserved` as [left, top, right, bottom].
+    """
     x, y = monitor["x"], monitor["y"]
     w, h = monitor["width"], monitor["height"]
-    top, bottom, left, right = 0, 0, 0, 0
+    left, top, right, bottom = 0, 0, 0, 0
     reserved = monitor.get("reserved")
     if isinstance(reserved, list) and len(reserved) == 4:
-        top, bottom, left, right = reserved
+        left, top, right, bottom = reserved
     return x + left, y + top, w - left - right, h - top - bottom
 
 
@@ -255,11 +275,38 @@ def check_case(case: dict, scratch_ws: int, shots: bool) -> tuple[bool, list[str
         found = wait_for_windows(case["windows"])
         move_to_workspace(scratch_ws, found)
 
+        def step(args: list[str]) -> dict:
+            return run_apply(*[str(scratch_ws) if a == "<ws>" else a for a in args])
+
+        # Anything the case needs to happen to the workspace before the shape it
+        # is checking: an earlier split, a release, and so on.
+        for args in case.get("pre", []):
+            payload = step(args)
+            if payload.get("error"):
+                failures.append(f"pre-step {' '.join(args)}: {payload['error']}")
+            time.sleep(0.9)
+
         # Apply the preset through the plugin's own helper.
         payload = run_apply("apply", str(scratch_ws), case["preset"])
         if payload.get("error"):
             failures.append(f"helper error: {payload['error']}")
         time.sleep(1.2)
+
+        # Switching the shape must move every window on the workspace, not just
+        # the next one to open.
+        if case.get("switch"):
+            before = {c["title"]: (tuple(c["at"]), tuple(c["size"])) for c in clients()}
+            for args in case["switch"]:
+                payload = step(args)
+                if payload.get("error"):
+                    failures.append(f"switch-step {' '.join(args)}: {payload['error']}")
+            time.sleep(1.5)
+            after = {c["title"]: (tuple(c["at"]), tuple(c["size"])) for c in clients()}
+            stale = [t for t in before if t in after and before[t] == after[t]]
+            if stale:
+                failures.append(
+                    f"still at their pre-switch geometry after the shape changed: {', '.join(sorted(stale))}"
+                )
 
         workspace = next(
             (w for w in hyprctl_json("workspaces", "-j") if w["id"] == scratch_ws), None
@@ -284,7 +331,8 @@ def check_case(case: dict, scratch_ws: int, shots: bool) -> tuple[bool, list[str
         # Hyprland hands windows back without a creation marker, so pair them
         # with the expectation list by title (CS-VIS-<n>).
         by_title = {c.get("title", ""): c for c in found}
-        slots = SLOTS[case["preset"]]
+        expected_preset = case.get("expect_preset", case["preset"])
+        slots = SLOTS[expected_preset]
 
         # Slot x-ranges and, inside a slot, the y-ranges of its stacked rows.
         slot_x = []
@@ -344,7 +392,7 @@ def check_case(case: dict, scratch_ws: int, shots: bool) -> tuple[bool, list[str
 
         # The crisp, human-meaningful check for the headline preset: the widest
         # window sits in the middle of the screen, between the two narrower ones.
-        if case["preset"] == "qhq" and case["windows"] >= 3:
+        if expected_preset == "qhq" and case["windows"] >= 3:
             ordered = sorted(found, key=lambda c: c["at"][0])
             centre_window = ordered[1]
             widest = max(found, key=lambda c: c["size"][0])

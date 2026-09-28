@@ -50,8 +50,9 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh() }
-    function apply(): void { if (root.widget) root.widget.applyToWorkspace(root.workspaceId, root.preset) }
-    function release(): void { if (root.widget) root.widget.releaseWorkspace(root.workspaceId) }
+    function shape(preset: string): void { if (root.widget) root.widget.applyShape(preset) }
+    function apply(): void { if (root.widget) root.widget.applyToWorkspace("current", root.preset) }
+    function release(): void { if (root.widget) root.widget.releaseWorkspace("current") }
     function reapply(): void { if (root.widget) root.widget.reapply() }
   }
 
@@ -104,7 +105,7 @@ Panel {
         Text {
           width: parent.width
           wrapMode: Text.WordWrap
-          text: "Dwindle puts a half on one side and two quarters stacked on the other. 1/4 · 1/2 · 1/4 keeps the half in the middle and gives it to the first window."
+          text: "Dwindle puts a half on one side and two quarters stacked on the other. 1/4 · 1/2 · 1/4 keeps the half in the middle and gives it to the first window. Picking a shape splits this workspace with it."
           color: Qt.darker(root.contentForeground, 1.2)
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.body
@@ -140,7 +141,7 @@ Panel {
             MouseArea {
               anchors.fill: parent
               cursorShape: Qt.PointingHandCursor
-              onClicked: if (root.widget) root.widget.setPreset(card.modelData.id)
+              onClicked: if (root.widget) root.widget.applyShape(card.modelData.id)
             }
 
             Row {
@@ -215,7 +216,7 @@ Panel {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: if (root.widget) root.widget.applyToWorkspace(root.workspaceId, root.preset)
+              onClicked: if (root.widget) root.widget.applyToWorkspace("current", root.preset)
             }
           }
 
@@ -231,7 +232,7 @@ Panel {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: if (root.widget) root.widget.releaseWorkspace(root.workspaceId)
+              onClicked: if (root.widget) root.widget.releaseWorkspace("current")
             }
           }
         }

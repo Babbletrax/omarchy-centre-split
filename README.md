@@ -41,14 +41,16 @@ Click the bar label (it reads the active shape, e.g. `1/4 · 1/2 · 1/4`).
 
 | Action | What it does |
 |--------|--------------|
-| **1/4 · 1/2 · 1/4** | The headline split. The first window takes the centre half, the second the left quarter, the third the right. A fourth stacks under the centre half, and so on. A lone window keeps the centre half rather than filling the screen. |
+| **1/4 · 1/2 · 1/4** | The headline split: first window in the centre half, second in the left quarter, third in the right. A fourth stacks under the centre half. A lone window keeps the centre half rather than filling the screen. |
 | **Even** | Two equal columns; a lone window fills the screen. |
 | **Thirds** | Three equal columns. |
 | **Half** | Plain 50/50. |
-| **Split this workspace** | Switches the split on for the focused workspace. |
+| **Split this workspace** | Re-applies the current shape to the focused workspace. |
 | **Back to dwindle** | Hands the focused workspace back to Omarchy's default tiling. |
 | **Every workspace** | Sets Hyprland's default layout to the split. This is the only action that changes the compositor default, and only when you click it. |
 | **Reapply** | Re-registers the layout and re-applies your saved choices. Use after `hyprctl reload`, which wipes runtime-registered layouts. |
+
+Clicking a shape splits the workspace you are looking at with it — the plugin resolves the focused workspace at the moment you click, never from a cached id, so the split always lands where you are.
 
 The shape is per compositor, not per workspace: Hyprland resolves custom layout names by first-registered in this build (see [Troubleshooting](#troubleshooting)), so the plugin registers exactly one layout and the shape is switched with a layout message. Which *workspaces* use the split is still per workspace.
 
@@ -60,11 +62,21 @@ Panel keybinding, in `~/.config/hypr/bindings.lua`:
 o.bind("SUPER + ALT + C", "Centre split", "omarchy-shell shell summon io.github.babbletrax.centre-split '{}'")
 ```
 
+The same actions are available over shell IPC, so they can be bound or scripted:
+
+```sh
+omarchy-shell io.github.babbletrax.centre-split shape thirds   # split where you are, with that shape
+omarchy-shell io.github.babbletrax.centre-split apply          # re-apply the current shape
+omarchy-shell io.github.babbletrax.centre-split release        # back to dwindle
+omarchy-shell io.github.babbletrax.centre-split reapply        # re-register and restore
+```
+
 The helper is usable on its own — handy in a terminal, a script, or a keybinding:
 
 ```sh
 apply register            # load the layout, set the saved preset
 apply apply 3             # split workspace 3 with the saved preset
+apply apply current       # ...or whatever workspace is focused right now
 apply apply 3 thirds      # ...or with a named one
 apply preset even         # switch the shape everywhere the split is on
 apply release 3           # workspace 3 back to dwindle
@@ -92,7 +104,9 @@ Two behaviours of this Hyprland build shape the design, and both were confirmed 
 Two more, found the hard way:
 
 - `hyprctl eval` **cannot drive the loaded layout**: it returns no values and shares no state with it. The preset therefore moves through `hyprctl dispatch 'hl.dsp.layout("<preset>")'`, which re-tiles immediately and answers a bad name with a real error.
-- Re-setting a workspace rule to the value it already has **does not re-tile**, so the helper flips the rule through `dwindle` and back to make a preset change visible at once.
+- Re-setting a workspace rule to the value it already has **does not re-tile**. A workspace can therefore report one layout while its windows still hold another one's geometry — the half-drawn split this plugin used to leave behind. Whenever the rule assignment would be a no-op, the helper flips the rule through a different layout (`dwindle`, then `master`) with a pause either side and checks that the windows actually moved, rather than trusting the assignment.
+- Two `hyprctl eval` calls back to back **coalesce into no net change**, so each step of that flip needs a settle pause (`CENTRE_SPLIT_SETTLE`, default 0.35s) between them.
+- A layout message is delivered to the **focused** workspace's layout, so switching a shape while sitting on an unsplit workspace borrows it, sends the message, and genuinely re-tiles it back — a same-value rule assignment would have handed it back reporting `dwindle` while still showing the split.
 
 ## Testing
 
@@ -104,7 +118,9 @@ tests/run_all.sh --shots    # also save tests/screenshots/<case>.png
 
 `tests/layout_test.lua` runs `layouts.lua` against a mock layout context: slot arithmetic per preset, one/two/three/four windows, stacking, and preset bookkeeping. No compositor needed, so it works over SSH.
 
-`tests/visual_test.py` is the visual proof. It opens real windows on a scratch workspace (default 90), applies each preset through the plugin's own helper, screenshots the result with `grim` when asked, and measures where Hyprland actually put the windows against the fractions that preset promises — width, x, height and y, plus a crisp check that the widest window is the middle one and is centred on the screen. It saves and restores the focused workspace and your saved preset, releases the scratch workspace afterwards, and clears desktop toasts before each screenshot so the image shows the tiling and nothing else. Cases: `qhq-3`, `qhq-1`, `qhq-2`, `qhq-4`, `even-2`, `thirds-3`, `halves-2`.
+`tests/visual_test.py` is the visual proof. It opens real windows on a scratch workspace (default 90), applies each preset through the plugin's own helper, screenshots the result with `grim` when asked, and measures where Hyprland actually put the windows against the fractions that preset promises — width, x, height and y, plus a crisp check that the widest window is the middle one and is centred on the screen. It saves and restores the focused workspace and your saved preset, releases the scratch workspace afterwards, and clears desktop toasts before each screenshot so the image shows the tiling and nothing else. Cases: `qhq-3`, `qhq-1`, `qhq-2`, `qhq-4`, `even-2`, `thirds-3`, `halves-2`, `resplit-after-release` (split a workspace that had the split before and was handed back), `switch-shape-live` (switch shape on a split workspace and require **every** window to move).
+
+`tests/click_path.sh` covers the path you actually use: it drives the plugin over shell IPC exactly as the panel does — three real windows, then `shape qhq`, `shape thirds`, `release` — and asserts all three shapes land on the **focused** workspace and on no other. That is the regression that matters here: a cached workspace id can split somewhere you are not looking, and geometry alone will not notice.
 
 Before the cases it runs a one-window preflight: if the layout name does not resolve — a foreign Lua layout won registration — it clears that with `apply reclaim` and retries once, rather than failing seven times over.
 
@@ -128,6 +144,16 @@ apply preset thirds
 ```
 
 It reports the Hyprland error verbatim (exit 3), and its log lines say when it borrowed the focused workspace to deliver the message.
+
+**A window is half the size it should be, or a pane hangs off the screen.** That is the stale-geometry case: the workspace's rule no longer matches the geometry its windows are holding, so nothing re-tiled them. Fix it in place:
+
+```sh
+apply apply current       # re-split what you are looking at, forcing a re-tile
+```
+
+Or **Back to dwindle** and pick the shape again. Both now force a real re-tile and verify that the windows moved.
+
+**A shape click split a workspace you were not on.** Fixed in 1.1.0: the widget no longer caches the workspace id. If you are on an older copy, `apply release <ws>` the wrong one and update.
 
 **Nothing you do through `hyprctl eval` changes the layout.** By design: on this build `eval` returns no values and cannot reach the registered layout. Use `hl.dsp.layout("<preset>")` — that is the channel the plugin's own switching uses.
 
