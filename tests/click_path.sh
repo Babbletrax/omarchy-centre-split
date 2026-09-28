@@ -37,12 +37,18 @@ cleanup() {
     hyprctl dispatch "hl.dsp.window.close({ window = \"address:$a\" })" >/dev/null
   done
   "$APPLY" release "$WS" >/dev/null 2>&1
+  # The shape is global to the compositor, so switching it here re-tiles every
+  # workspace that is split -- put the user's saved preset back.
+  if [[ -n ${SAVED_PRESET:-} ]]; then
+    "$APPLY" preset "$SAVED_PRESET" >/dev/null 2>&1
+  fi
   sleep 0.5
   [[ -n ${ORIGINAL_WS:-} ]] && hyprctl dispatch "hl.dsp.focus({ workspace = \"$ORIGINAL_WS\" })" >/dev/null
 }
 trap cleanup EXIT INT TERM
 
 ORIGINAL_WS="$(hyprctl activeworkspace -j | jq -r '.id')"
+SAVED_PRESET="$("$APPLY" status 2>/dev/null | jq -r '.state.preset // "qhq"')"
 BEFORE_STATE="$(state_workspaces | sort | tr '\n' ' ')"
 echo "click-path test (workspace $WS, you were on $ORIGINAL_WS)"
 
