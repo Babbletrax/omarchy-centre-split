@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.babbletrax.centre-split",
+  "name": "Centre Split",
+  "version": "1.0.0",
+  "author": "Babbletrax",
+  "license": "MIT",
+  "description": "Three-window tiling with the half in the centre: 1/4 · 1/2 · 1/4. Also even, thirds, and 50/50.",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "service": "Service.qml"
+  },
+  "barWidget": {
+    "displayName": "Centre Split",
+    "description": "Pick a workspace split. 1/4 · 1/2 · 1/4 keeps the wide pane in the middle.",
+    "category": "Desktop",
+    "allowMultiple": false,
+    "defaultSection": "left"
+  }
+}

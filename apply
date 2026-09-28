@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Register Centre Split layouts with Hyprland and apply one to a workspace.
+# Only talks to hyprctl. Does not edit hyprland.lua or any sudoers file.
+
+set -euo pipefail
+
+PLUGIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+LAYOUTS="$PLUGIN_DIR/layouts.lua"
+STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
+STATE_FILE="$STATE_DIR/centre-split.json"
+OMARCHY_LAYOUTS_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-layouts"
+
+ALLOWED_LAYOUTS='lua:centre-split|lua:centre-split-even|lua:centre-split-thirds|lua:centre-split-half|dwindle|scrolling|master'
+
+fail() {
+  echo "centre-split: $*" >&2
+  exit 1
+}
+
+layout_ok() {
+  [[ $1 =~ ^($ALLOWED_LAYOUTS)$ ]]
+}
+
+ws_ok() {
+  [[ $1 =~ ^[0-9]+$ ]]
+}
+
+ensure_state() {
+  mkdir -p "$STATE_DIR"
+  if [[ ! -f $STATE_FILE ]]; then
+    printf '%s\n' '{"default":"","workspaces":{}}' >"$STATE_FILE"
+  fi
+}
+
+read_state() {
+  ensure_state
+  cat "$STATE_FILE"
+}
+
+write_state_workspace() {
+  local ws="$1" layout="$2"
+  ensure_state
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/centre-split.XXXXXX.json")"
+  jq --arg ws "$ws" --arg layout "$layout" '
+    .workspaces = ((.workspaces // {}) + {($ws): $layout})
+  ' "$STATE_FILE" >"$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+write_state_default() {
+  local layout="$1"
+  ensure_state
+  local tmp
+  tmp="$(mktemp "$STATE_DIR/centre-split.XXXXXX.json")"
+  jq --arg layout "$layout" '.default = $layout' "$STATE_FILE" >"$tmp"
+  mv "$tmp" "$STATE_FILE"
+}
+
+write_omarchy_restore() {
+  local ws="$1" layout="$2"
+  mkdir -p "$OMARCHY_LAYOUTS_DIR"
+  printf 'hl.workspace_rule({ workspace = "%s", layout = "%s" })\n' "$ws" "$layout" \
+    >"$OMARCHY_LAYOUTS_DIR/$ws.lua"
+}
+
+register() {
+  [[ -f $LAYOUTS ]] || fail "layouts.lua missing at $LAYOUTS"
+  hyprctl eval "dofile([[${LAYOUTS}]])" >/dev/null
+}
+
+apply_workspace() {
+  local ws="$1" layout="$2"
+  ws_ok "$ws" || fail "workspace must be an integer"
+  layout_ok "$layout" || fail "layout not allowed: $layout"
+  register
+  hyprctl eval "hl.workspace_rule({ workspace = \"${ws}\", layout = \"${layout}\" })" >/dev/null
+  write_state_workspace "$ws" "$layout"
+  write_omarchy_restore "$ws" "$layout"
+}
+
+apply_default() {
+  local layout="$1"
+  layout_ok "$layout" || fail "layout not allowed: $layout"
+  register
+  hyprctl keyword general:layout "$layout" >/dev/null
+  write_state_default "$layout"
+}
+
+restore() {
+  register
+  ensure_state
+  local default
+  default="$(jq -r '.default // ""' "$STATE_FILE")"
+  if [[ -n $default && $default != null ]] && layout_ok "$default"; then
+    hyprctl keyword general:layout "$default" >/dev/null || true
+  fi
+  jq -r '.workspaces // {} | to_entries[] | "\(.key)\t\(.value)"' "$STATE_FILE" |
+    while IFS=$'\t' read -r ws layout; do
+      [[ -n $ws && -n $layout ]] || continue
+      ws_ok "$ws" || continue
+      layout_ok "$layout" || continue
+      hyprctl eval "hl.workspace_rule({ workspace = \"${ws}\", layout = \"${layout}\" })" >/dev/null || true
+    done
+}
+
+status() {
+  local ws layout
+  ws="$(hyprctl activeworkspace -j | jq -r '.id')"
+  layout="$(hyprctl activeworkspace -j | jq -r '.tiledLayout')"
+  ensure_state
+  jq -n \
+    --arg ws "$ws" \
+    --arg layout "$layout" \
+    --argjson state "$(cat "$STATE_FILE")" \
+    '{workspace: ($ws | tonumber), layout: $layout, state: $state}'
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  register) register ;;
+  apply)
+    apply_workspace "${2:-}" "${3:-}"
+    status
+    ;;
+  default)
+    apply_default "${2:-}"
+    status
+    ;;
+  restore) restore ;;
+  status) status ;;
+  *)
+    fail "usage: apply {register|apply <workspace> <layout>|default <layout>|restore|status}"
+    ;;
+esac
