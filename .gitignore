@@ -2,3 +2,6 @@
 *.qmlc
 *.jsc
 *.swp
+
+# Live-test artefacts: regenerate with `tests/run_all.sh --shots`.
+tests/screenshots/

@@ -1,4 +1,8 @@
 -- Geometry tests for layouts.lua. Run: lua tests/layout_test.lua
+--
+-- layouts.lua is loaded here without Hyprland: register() no-ops when `hl` is
+-- missing, so the same code the compositor runs can be exercised with a mock
+-- layout context.
 
 local here = debug.getinfo(1, "S").source:gsub("^@", "")
 local dir = here:match("(.*/)") or "./"
@@ -7,9 +11,11 @@ if not plugin then
   error("layouts.lua did not return the module")
 end
 
+local W, H = 1000, 400
+
 local function mock_ctx(n, w, h)
-  w = w or 1000
-  h = h or 400
+  w = w or W
+  h = h or H
   local targets = {}
   for i = 1, n do
     targets[i] = {
@@ -54,64 +60,130 @@ local function check(name, cond, detail)
   end
 end
 
--- 3 windows, 1/4 1/2 1/4: first window is the centre half
-do
-  local ctx = mock_ctx(3)
-  plugin.place(ctx, plugin.PRESETS["centre-split"])
-  local a, b, c = ctx.targets[1].box, ctx.targets[2].box, ctx.targets[3].box
-  check("qhq centre x", almost(a.x, 250), "x=" .. a.x)
-  check("qhq centre w", almost(a.w, 500), "w=" .. a.w)
-  check("qhq left x", almost(b.x, 0), "x=" .. b.x)
-  check("qhq left w", almost(b.w, 250), "w=" .. b.w)
-  check("qhq right x", almost(c.x, 750), "x=" .. c.x)
-  check("qhq right w", almost(c.w, 250), "w=" .. c.w)
-  check("qhq full height", almost(a.h, 400) and almost(b.h, 400) and almost(c.h, 400))
+local function place(n, preset)
+  local ctx = mock_ctx(n)
+  plugin.place(ctx, plugin.PRESETS[preset])
+  return ctx
 end
 
--- 1 window keep-place: sits in the centre 50%, not stretched
+-- ---- The registered layout is a single, unambiguous name.
+check("one layout name", plugin.LAYOUT_NAME == "centre-split", tostring(plugin.LAYOUT_NAME))
+check("four presets", #plugin.PRESET_NAMES == 4, table.concat(plugin.PRESET_NAMES, ","))
+
+-- ---- Preset bookkeeping.
+check("default preset is qhq", plugin.preset() == plugin.DEFAULT_PRESET, plugin.preset())
+check("set_preset accepts a known name", plugin.set_preset("even") == true)
+check("set_preset took effect", plugin.preset() == "even", plugin.preset())
+local ok, err = plugin.set_preset("nonsense")
+check("set_preset rejects an unknown name", ok == false and type(err) == "string", tostring(err))
+check("preset unchanged after a rejected set", plugin.preset() == "even", plugin.preset())
+plugin.set_preset("qhq")
+
+-- ---- qhq (1/4 | 1/2 | 1/4), three windows: the centre half gets window 1.
 do
-  local ctx = mock_ctx(1)
-  plugin.place(ctx, plugin.PRESETS["centre-split"])
-  local a = ctx.targets[1].box
-  check("one window centre x", almost(a.x, 250), "x=" .. a.x)
-  check("one window centre w", almost(a.w, 500), "w=" .. a.w)
+  local ctx = place(3, "qhq")
+  local centre, left, right = ctx.targets[1].box, ctx.targets[2].box, ctx.targets[3].box
+  check("qhq centre x", almost(centre.x, 250), "x=" .. centre.x)
+  check("qhq centre w", almost(centre.w, 500), "w=" .. centre.w)
+  check("qhq left x", almost(left.x, 0), "x=" .. left.x)
+  check("qhq left w", almost(left.w, 250), "w=" .. left.w)
+  check("qhq right x", almost(right.x, 750), "x=" .. right.x)
+  check("qhq right w", almost(right.w, 250), "w=" .. right.w)
+  check(
+    "qhq full height",
+    almost(centre.h, H) and almost(left.h, H) and almost(right.h, H),
+    string.format("%s/%s/%s", centre.h, left.h, right.h)
+  )
 end
 
--- 2 windows keep-place: centre + left, right empty
+-- ---- qhq with one window keeps the centre half (no rescale to fullscreen).
 do
-  local ctx = mock_ctx(2)
-  plugin.place(ctx, plugin.PRESETS["centre-split"])
-  check("two windows centre", almost(ctx.targets[1].box.x, 250) and almost(ctx.targets[1].box.w, 500))
-  check("two windows left", almost(ctx.targets[2].box.x, 0) and almost(ctx.targets[2].box.w, 250))
+  local ctx = place(1, "qhq")
+  local only = ctx.targets[1].box
+  check("one window stays centre x", almost(only.x, 250), "x=" .. only.x)
+  check("one window stays centre w", almost(only.w, 500), "w=" .. only.w)
+  check("one window full height", almost(only.h, H), "h=" .. only.h)
 end
 
--- 4 windows: extra stacks in the centre
+-- ---- qhq with two windows: centre, then the left quarter.
 do
-  local ctx = mock_ctx(4)
-  plugin.place(ctx, plugin.PRESETS["centre-split"])
-  local a, extra = ctx.targets[1].box, ctx.targets[4].box
-  check("extra in centre x", almost(a.x, extra.x) and almost(a.w, extra.w),
-    string.format("a=(%.1f,%.1f) extra=(%.1f,%.1f)", a.x, a.w, extra.x, extra.w))
-  check("extra stacked vertically", almost(a.h + extra.h, 400), "h=" .. a.h .. "+" .. extra.h)
+  local ctx = place(2, "qhq")
+  check(
+    "two windows: centre first",
+    almost(ctx.targets[1].box.x, 250) and almost(ctx.targets[1].box.w, 500)
+  )
+  check(
+    "two windows: then left",
+    almost(ctx.targets[2].box.x, 0) and almost(ctx.targets[2].box.w, 250)
+  )
 end
 
--- even, 1 window rescales to full
+-- ---- qhq with four windows: the extra stacks inside the centre half.
 do
-  local ctx = mock_ctx(1)
-  plugin.place(ctx, plugin.PRESETS["centre-split-even"])
-  check("even one window full", almost(ctx.targets[1].box.x, 0) and almost(ctx.targets[1].box.w, 1000))
+  local ctx = place(4, "qhq")
+  local first, extra = ctx.targets[1].box, ctx.targets[4].box
+  check(
+    "extra shares the centre column",
+    almost(first.x, extra.x) and almost(first.w, extra.w),
+    string.format("first=(%.1f,%.1f) extra=(%.1f,%.1f)", first.x, first.w, extra.x, extra.w)
+  )
+  check(
+    "extra stacks vertically in it",
+    almost(first.h + extra.h, H),
+    string.format("h=%.1f+%.1f", first.h, extra.h)
+  )
+  check("centre stack starts at the top", almost(first.y, 0), "y=" .. first.y)
+  check("extra sits below", almost(extra.y, H / 2), "y=" .. extra.y)
 end
 
--- thirds, 3 windows equal
+-- ---- even: one window fills the screen, two split evenly.
 do
-  local ctx = mock_ctx(3)
-  plugin.place(ctx, plugin.PRESETS["centre-split-thirds"])
-  check("thirds left", almost(ctx.targets[1].box.x, 0) and almost(ctx.targets[1].box.w, 1000 / 3, 1.0))
-  check("thirds mid", almost(ctx.targets[2].box.x, 1000 / 3, 1.0) and almost(ctx.targets[2].box.w, 1000 / 3, 1.0))
+  local one = place(1, "even")
+  check(
+    "even one window fills",
+    almost(one.targets[1].box.x, 0) and almost(one.targets[1].box.w, W)
+  )
+  local two = place(2, "even")
+  check(
+    "even two windows",
+    almost(two.targets[1].box.w, W / 2) and almost(two.targets[2].box.x, W / 2)
+  )
+end
+
+-- ---- thirds: three equal columns, left to right.
+do
+  local ctx = place(3, "thirds")
+  check(
+    "thirds left",
+    almost(ctx.targets[1].box.x, 0) and almost(ctx.targets[1].box.w, W / 3, 1.0)
+  )
+  check(
+    "thirds middle",
+    almost(ctx.targets[2].box.x, W / 3, 1.0) and almost(ctx.targets[2].box.w, W / 3, 1.0)
+  )
   check("thirds right", almost(ctx.targets[3].box.x, 2000 / 3, 1.0))
 end
 
+-- ---- halves: plain 50/50, and a lone window fills.
+do
+  local ctx = place(2, "halves")
+  check("halves left", almost(ctx.targets[1].box.x, 0) and almost(ctx.targets[1].box.w, W / 2))
+  check("halves right", almost(ctx.targets[2].box.x, W / 2))
+  local one = place(1, "halves")
+  check("halves one window fills", almost(one.targets[1].box.w, W))
+end
+
+-- ---- Every preset accounts for exactly the whole width.
+for _, name in ipairs(plugin.PRESET_NAMES) do
+  local sum = 0
+  for _, frac in ipairs(plugin.PRESETS[name].slots) do
+    sum = sum + frac
+  end
+  check("preset " .. name .. " slots sum to 1", almost(sum, 1, 0.0001), tostring(sum))
+end
+
 if fails > 0 then
+  print(string.format("%d check(s) failed", fails))
   os.exit(1)
 end
 print("all passed")

@@ -1,135 +1,521 @@
 #!/usr/bin/env bash
-# Register Centre Split layouts with Hyprland and apply one to a workspace.
-# Only talks to hyprctl. Does not edit hyprland.lua or any sudoers file.
+# Centre Split helper: register the plugin's Hyprland layout and drive it.
+#
+# Talks to Hyprland through hyprctl only. Does not edit hyprland.lua, does not
+# use sudo, and keeps its temp files inside the user's config directory.
+#
+# Exit codes: 0 ok, 1 usage/validation error, 2 Hyprland unreachable,
+#             3 Hyprland rejected the request, 4 the layout did not resolve.
+#
+# Every command prints one JSON object on stdout, so callers (the bar widget and
+# the panel) can show a reason instead of guessing. Human-readable detail goes to
+# stderr prefixed with "omarchy centre-split", which is what `omarchy debug` and
+# the shell log capture.
+#
+# Notifications are native Omarchy system notifications (omarchy-notification-send,
+# falling back to notify-send). Set CENTRE_SPLIT_NOTIFY=0 to silence them.
 
 set -euo pipefail
 
-PLUGIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAYOUTS="$PLUGIN_DIR/layouts.lua"
-STATE_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
-STATE_FILE="$STATE_DIR/centre-split.json"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy"
+STATE_FILE="$CONFIG_DIR/centre-split.json"
 OMARCHY_LAYOUTS_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/workspace-layouts"
+LOG_TAG="omarchy centre-split"
 
-ALLOWED_LAYOUTS='lua:centre-split|lua:centre-split-even|lua:centre-split-thirds|lua:centre-split-half|dwindle|scrolling|master'
+LAYOUT="lua:centre-split"
+ALLOWED_LAYOUTS='lua:centre-split|dwindle|scrolling|master'
+PRESETS=(qhq even thirds halves)
+PRESET_LABELS=( "1/4 · 1/2 · 1/4" "Even" "Thirds" "Half" )
 
-fail() {
-  echo "centre-split: $*" >&2
-  exit 1
+VERIFY_NOTE=""
+TMP_FILES=()
+
+cleanup() {
+  local f
+  for f in ${TMP_FILES[@]+"${TMP_FILES[@]}"}; do
+    [[ -n $f ]] && rm -f "$f"
+  done
 }
+trap cleanup EXIT
 
-layout_ok() {
-  [[ $1 =~ ^($ALLOWED_LAYOUTS)$ ]]
-}
+log() { printf '%s %s\n' "$LOG_TAG" "$*" >&2; }
 
-ws_ok() {
-  [[ $1 =~ ^[0-9]+$ ]]
-}
-
-ensure_state() {
-  mkdir -p "$STATE_DIR"
-  if [[ ! -f $STATE_FILE ]]; then
-    printf '%s\n' '{"default":"","workspaces":{}}' >"$STATE_FILE"
+notify() { # native system notification: notify <urgency> <headline> [body]
+  # Omarchy's own toasts. Errors get a bounded lifetime so a sticky 'critical'
+  # bubble cannot pile up on the desktop and hide what actually changed.
+  [[ ${CENTRE_SPLIT_NOTIFY:-1} == 0 ]] && return 0
+  local urgency="$1" headline="$2" body="${3:-}" timeout
+  case "$urgency" in
+    critical) timeout="${CENTRE_SPLIT_NOTIFY_TIMEOUT:-12000}" ;;
+    normal) timeout=8000 ;;
+    *) timeout=4000 ;;
+  esac
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send -u "$urgency" -t "$timeout" "$headline" ${body:+"$body"} >/dev/null 2>&1 || true
+  elif command -v notify-send >/dev/null 2>&1; then
+    notify-send -u "$urgency" -t "$timeout" -a "Centre Split" "$headline" ${body:+"$body"} >/dev/null 2>&1 || true
   fi
 }
 
-read_state() {
-  ensure_state
-  cat "$STATE_FILE"
+fail() { # fail <exit-code> <message>
+  local code="$1"; shift
+  local message="$*"
+  log "ERROR $message"
+  jq -n --arg e "$message" '{ok: false, error: $e}'
+  notify normal "Centre split" "$message"
+  exit "$code"
 }
 
-write_state_workspace() {
-  local ws="$1" layout="$2"
-  ensure_state
+layout_ok() { [[ ${1:-} =~ ^($ALLOWED_LAYOUTS)$ ]]; }
+ws_ok() { [[ ${1:-} =~ ^[1-9][0-9]*$ ]]; }
+
+preset_ok() {
+  local p="${1:-}" candidate
+  for candidate in "${PRESETS[@]}"; do
+    [[ $p == "$candidate" ]] && return 0
+  done
+  return 1
+}
+
+preset_label() {
+  local i
+  for i in "${!PRESETS[@]}"; do
+    [[ ${PRESETS[$i]} == "${1:-}" ]] && { printf '%s' "${PRESET_LABELS[$i]}"; return 0; }
+  done
+  printf '%s' "${1:-}"
+}
+
+hypr_reachable() { hyprctl monitors >/dev/null 2>&1; }
+
+require_deps() {
+  local bin
+  for bin in hyprctl jq; do
+    command -v "$bin" >/dev/null 2>&1 || fail 1 "missing required command: $bin"
+  done
+  [[ -f $LAYOUTS ]] || fail 1 "layouts.lua missing at $LAYOUTS"
+  hypr_reachable || fail 2 "Hyprland is not reachable"
+}
+
+hypr_eval() { # echoes hyprctl's output, returns its status (7 on a Lua error)
+  local out status
+  set +e
+  out="$(hyprctl eval "$1" 2>&1)"
+  status=$?
+  set -e
+  printf '%s' "$out"
+  return "$status"
+}
+
+ensure_config_dir() { mkdir -p "$CONFIG_DIR"; }
+
+state_json() { # never fails: a missing or corrupt file reads as empty state
+  ensure_config_dir
+  if [[ -f $STATE_FILE ]]; then
+    if jq -e . "$STATE_FILE" >/dev/null 2>&1; then
+      cat "$STATE_FILE"
+      return 0
+    fi
+    log "state file is not valid JSON, treating it as empty: $STATE_FILE"
+  fi
+  jq -n --arg preset "${PRESETS[0]}" '{preset: $preset, default: "", workspaces: {}}'
+}
+
+saved_preset() {
+  local preset
+  preset="$(state_json | jq -r '.preset // ""')"
+  if preset_ok "$preset"; then
+    printf '%s' "$preset"
+  else
+    printf '%s' "${PRESETS[0]}"
+  fi
+}
+
+write_state() { # write_state <jq-filter> [jq args...], applied to current state
+  local filter="$1"; shift
+  ensure_config_dir
   local tmp
-  tmp="$(mktemp "$STATE_DIR/centre-split.XXXXXX.json")"
-  jq --arg ws "$ws" --arg layout "$layout" '
-    .workspaces = ((.workspaces // {}) + {($ws): $layout})
-  ' "$STATE_FILE" >"$tmp"
+  tmp="$(mktemp "$CONFIG_DIR/centre-split.XXXXXX.json")"
+  TMP_FILES+=("$tmp")
+  if ! jq "$@" "$filter" <(state_json) >"$tmp"; then
+    fail 1 "could not update the saved split state"
+  fi
   mv "$tmp" "$STATE_FILE"
 }
 
-write_state_default() {
-  local layout="$1"
-  ensure_state
-  local tmp
-  tmp="$(mktemp "$STATE_DIR/centre-split.XXXXXX.json")"
-  jq --arg layout "$layout" '.default = $layout' "$STATE_FILE" >"$tmp"
-  mv "$tmp" "$STATE_FILE"
-}
-
-write_omarchy_restore() {
+write_omarchy_restore() { # keep Super+L's own restore file in step
   local ws="$1" layout="$2"
   mkdir -p "$OMARCHY_LAYOUTS_DIR"
   printf 'hl.workspace_rule({ workspace = "%s", layout = "%s" })\n' "$ws" "$layout" \
     >"$OMARCHY_LAYOUTS_DIR/$ws.lua"
 }
 
-register() {
-  [[ -f $LAYOUTS ]] || fail "layouts.lua missing at $LAYOUTS"
-  hyprctl eval "dofile([[${LAYOUTS}]])" >/dev/null
-}
+remove_omarchy_restore() { rm -f "$OMARCHY_LAYOUTS_DIR/$1.lua"; }
 
-apply_workspace() {
-  local ws="$1" layout="$2"
-  ws_ok "$ws" || fail "workspace must be an integer"
-  layout_ok "$layout" || fail "layout not allowed: $layout"
-  register
-  hyprctl eval "hl.workspace_rule({ workspace = \"${ws}\", layout = \"${layout}\" })" >/dev/null
-  write_state_workspace "$ws" "$layout"
-  write_omarchy_restore "$ws" "$layout"
-}
-
-apply_default() {
-  local layout="$1"
-  layout_ok "$layout" || fail "layout not allowed: $layout"
-  register
-  hyprctl keyword general:layout "$layout" >/dev/null
-  write_state_default "$layout"
-}
-
-restore() {
-  register
-  ensure_state
-  local default
-  default="$(jq -r '.default // ""' "$STATE_FILE")"
-  if [[ -n $default && $default != null ]] && layout_ok "$default"; then
-    hyprctl keyword general:layout "$default" >/dev/null || true
+register() { # load layouts.lua; Hyprland rejects a repeat registration
+  local out status fatal
+  out="$(hypr_eval "dofile([[$LAYOUTS]])")" && status=0 || status=$?
+  if ((status != 0)); then
+    fatal="$(printf '%s\n' "$out" \
+      | grep -v 'already registered' \
+      | grep -v '^ok$' \
+      | grep -v '^[[:space:]]*$' || true)"
+    if [[ -n $fatal ]]; then
+      fail 3 "layout registration failed: $(printf '%s' "$fatal" | head -n 2 | tr '\n' ';')"
+    fi
+    log "layout already registered"
+    return 0
   fi
-  jq -r '.workspaces // {} | to_entries[] | "\(.key)\t\(.value)"' "$STATE_FILE" |
-    while IFS=$'\t' read -r ws layout; do
-      [[ -n $ws && -n $layout ]] || continue
-      ws_ok "$ws" || continue
-      layout_ok "$layout" || continue
-      hyprctl eval "hl.workspace_rule({ workspace = \"${ws}\", layout = \"${layout}\" })" >/dev/null || true
-    done
+  log "layout registered"
 }
 
-status() {
-  local ws layout
-  ws="$(hyprctl activeworkspace -j | jq -r '.id')"
-  layout="$(hyprctl activeworkspace -j | jq -r '.tiledLayout')"
-  ensure_state
+send_preset() { # send_preset <name> -- switch the live shape
+  # The loaded layout keeps the preset in its own state and a layout message is
+  # the only channel that reaches it. Messages go to the *focused* workspace's
+  # layout, so if the focused workspace is not using ours, borrow it for the
+  # message and hand it straight back.
+  #
+  # `hyprctl eval` is not an option here: it neither returns values nor shares
+  # globals with the loaded layout, so it cannot reach the provider at all.
+  local name="$1" ws previous borrowed=0 out status
+  ws="$(active_workspace)"
+  previous="$(active_layout)"
+
+  if ws_ok "$ws" && [[ $previous != "$LAYOUT" ]]; then
+    rule_for "$ws" "$LAYOUT"
+    borrowed=1
+  fi
+
+  out="$(hyprctl dispatch "hl.dsp.layout(\"$name\")" 2>&1)" && status=0 || status=$?
+
+  if ((borrowed == 1)); then
+    rule_for "$ws" "${previous:-dwindle}"
+    log "borrowed workspace $ws for the layout message and handed it back to ${previous:-dwindle}"
+  fi
+
+  if ((status != 0)); then
+    fail 3 "could not switch the preset to '$name': $(printf '%s\n' "$out" | grep -v '^ok$' | head -n 1)"
+  fi
+}
+
+rule_for() { # rule_for <workspace> <layout> -- set the workspace rule
+  local ws="$1" layout="$2" out status
+  out="$(hypr_eval "hl.workspace_rule({ workspace = \"$ws\", layout = \"$layout\" })")" && status=0 || status=$?
+  ((status == 0)) || fail 3 "Hyprland rejected the workspace rule: $(printf '%s' "$out" | head -n 1)"
+}
+
+workspace_layout() { # workspace_layout <id> -> its tiledLayout, or empty
+  hyprctl workspaces -j 2>/dev/null \
+    | jq -r --argjson ws "$1" '.[] | select(.id == $ws) | .tiledLayout' 2>/dev/null \
+    | head -n 1 || true
+}
+
+active_workspace() { hyprctl activeworkspace -j | jq -r '.id'; }
+active_layout() { hyprctl activeworkspace -j | jq -r '.tiledLayout'; }
+
+verify_workspace() { # catches a layout name that resolves to something else
+  local ws="$1" want="$2" got attempt
+  # Hyprland settles a workspace rule asynchronously, so poll rather than
+  # reading once and racing the compositor.
+  for attempt in 1 2 3 4 5 6 7 8; do
+    got="$(workspace_layout "$ws")"
+    if [[ -z $got ]]; then
+      VERIFY_NOTE="workspace $ws has no windows yet; the split applies when it opens"
+      log "$VERIFY_NOTE"
+      return 0
+    fi
+    if [[ $got == "$want" ]]; then
+      VERIFY_NOTE=""
+      return 0
+    fi
+    sleep 0.25
+  done
+
+  local hint=""
+  if [[ $got == lua:* ]]; then
+    hint=" Another Lua layout ('$got') is registered first in this Hyprland session, and this build resolves custom layouts by first-registered. Clear it with 'apply reclaim' (reloads the Hyprland config and re-registers)."
+  fi
+  fail 4 "layout did not resolve: asked for $want, Hyprland reports $got.${hint}"
+}
+
+force_retile() { # force_retile <workspace> -- make an active workspace re-run its layout
+  # Setting a workspace rule to the value it already has is a no-op, so the
+  # compositor never recalculates and a preset change would not show until the
+  # next window opens there. Flipping the rule through dwindle and back is a
+  # real change each time, so Hyprland re-tiles at once.
+  local ws="$1"
+  ws_ok "$ws" || return 1
+  rule_for "$ws" "dwindle"
+  rule_for "$ws" "$LAYOUT"
+  return 0
+}
+
+retile_saved() { # re-apply saved rules so a preset change shows immediately
+  local ws layout count=0
+  while IFS=$'\t' read -r ws layout; do
+    [[ -n ${ws:-} && -n ${layout:-} ]] || continue
+    ws_ok "$ws" || continue
+    layout_ok "$layout" || continue
+    if [[ $layout == "$LAYOUT" ]]; then
+      force_retile "$ws" && count=$((count + 1))
+    elif hypr_eval "hl.workspace_rule({ workspace = \"$ws\", layout = \"$layout\" })" >/dev/null; then
+      count=$((count + 1))
+    fi
+  done < <(state_json | jq -r '.workspaces // {} | to_entries[] | "\(.key)\t\(.value)"')
+
+  # The focused workspace can be using the layout without being in our state
+  # (set by hand, or by another tool): re-assert its rule too.
+  local current_ws
+  current_ws="$(active_workspace)"
+  if ws_ok "$current_ws" && [[ "$(active_layout)" == "$LAYOUT" ]]; then
+    force_retile "$current_ws" && count=$((count + 1))
+  fi
+  printf '%s' "$count"
+}
+
+result_json() { # result_json <workspace> <layout> [preset]
+  jq -n \
+    --argjson ws "$1" \
+    --arg layout "$2" \
+    --arg preset "${3:-$(saved_preset)}" \
+    --arg note "$VERIFY_NOTE" \
+    --argjson state "$(state_json)" \
+    '{ok: true, workspace: $ws, layout: $layout, preset: $preset, note: $note, state: $state}'
+}
+
+cmd_register() {
+  register
+  local preset
+  preset="$(saved_preset)"
+  send_preset "$preset"
+  jq -n --arg preset "$preset" '{ok: true, registered: true, preset: $preset}'
+}
+
+cmd_apply() { # apply <workspace> [preset]
+  local ws="${1:-}" preset="${2:-}"
+  ws_ok "$ws" || fail 1 "workspace must be a positive integer (got '${ws}')"
+  [[ -z $preset ]] || preset_ok "$preset" || fail 1 "unknown preset: '${preset}'"
+  register
+  if [[ -n $preset ]]; then
+    send_preset "$preset"
+    write_state '.preset = $preset' --arg preset "$preset"
+  fi
+  rule_for "$ws" "$LAYOUT"
+  force_retile "$ws"
+  write_state '.workspaces = ((.workspaces // {}) + {($ws): $layout})' \
+    --arg ws "$ws" --arg layout "$LAYOUT"
+  write_omarchy_restore "$ws" "$LAYOUT"
+  verify_workspace "$ws" "$LAYOUT"
+  if [[ -n $preset ]]; then
+    retile_saved >/dev/null
+  fi
+  result_json "$ws" "$LAYOUT"
+  notify low "Centre split" "$(preset_label "$(saved_preset)") · workspace $ws"
+}
+
+cmd_release() { # release <workspace>
+  local ws="${1:-}"
+  ws_ok "$ws" || fail 1 "workspace must be a positive integer (got '${ws}')"
+  register
+  rule_for "$ws" "dwindle"
+  write_state '.workspaces = ((.workspaces // {}) | del(.[$ws]))' --arg ws "$ws"
+  remove_omarchy_restore "$ws"
+  result_json "$ws" "dwindle"
+  notify low "Centre split" "workspace $ws back to dwindle"
+}
+
+cmd_preset() { # preset <name>
+  local preset="${1:-}"
+  preset_ok "$preset" || fail 1 "unknown preset: '${preset}' (expected: ${PRESETS[*]})"
+  register
+  send_preset "$preset"
+  write_state '.preset = $preset' --arg preset "$preset"
+  local retiled
+  retiled="$(retile_saved)"
+  result_json "$(active_workspace)" "$LAYOUT" "$preset"
+  log "preset '$preset' applied, re-tiled $retiled workspace rule(s)"
+  notify low "Centre split" "$(preset_label "$preset") everywhere the split is on"
+}
+
+cmd_default() { # default -- make the split Hyprland's default layout
+  local preset="${1:-}"
+  [[ -z $preset ]] || preset_ok "$preset" || fail 1 "unknown preset: '${preset}'"
+  register
+  if [[ -n $preset ]]; then
+    send_preset "$preset"
+    write_state '.preset = $preset' --arg preset "$preset"
+  fi
+  # `hyprctl keyword general:layout` is a silent no-op in this Hyprland build
+  # ("keyword can't work with non-legacy parsers") and still exits 0, so the
+  # default goes through the Lua API and is then read back.
+  local out status now
+  out="$(hypr_eval "hl.config({ general = { layout = \"$LAYOUT\" } })")" && status=0 || status=$?
+  ((status == 0)) || fail 3 "Hyprland rejected the default layout: $(printf '%s' "$out" | head -n 1)"
+  now="$(hyprctl getoption general:layout 2>/dev/null | head -n 1 | sed 's/^str:[[:space:]]*//' || true)"
+  [[ $now == "$LAYOUT" ]] || fail 4 "default layout did not stick (Hyprland reports '${now:-unknown}')"
+  write_state '.default = $layout' --arg layout "$LAYOUT"
+  VERIFY_NOTE=""
+  result_json "$(active_workspace)" "$(active_layout)"
+  notify low "Centre split" "$(preset_label "$(saved_preset)") for every workspace"
+}
+
+cmd_restore() { # re-apply saved choices at shell start, after a reload, or by hand
+  register
+  local preset applied=0 skipped=0 ws layout
+  preset="$(saved_preset)"
+  send_preset "$preset"
+  applied=$((applied + 1))
+
+  local default
+  default="$(state_json | jq -r '.default // ""')"
+  if [[ -n $default && $default != null ]]; then
+    if ! layout_ok "$default"; then
+      log "ignoring unknown saved default layout '$default'"
+      skipped=$((skipped + 1))
+    elif hypr_eval "hl.config({ general = { layout = \"$default\" } })" >/dev/null; then
+      applied=$((applied + 1))
+    else
+      log "could not restore the default layout '$default'"
+      skipped=$((skipped + 1))
+    fi
+  fi
+
+  while IFS=$'\t' read -r ws layout; do
+    [[ -n ${ws:-} && -n ${layout:-} ]] || continue
+    if ! ws_ok "$ws" || ! layout_ok "$layout"; then
+      log "ignoring saved entry for workspace '$ws' (layout '$layout')"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    if hypr_eval "hl.workspace_rule({ workspace = \"$ws\", layout = \"$layout\" })" >/dev/null; then
+      applied=$((applied + 1))
+    else
+      log "could not restore workspace $ws"
+      skipped=$((skipped + 1))
+    fi
+  done < <(state_json | jq -r '.workspaces // {} | to_entries[] | "\(.key)\t\(.value)"')
+
+  jq -n --argjson applied "$applied" --argjson skipped "$skipped" --arg preset "$preset" \
+    '{ok: true, preset: $preset, applied: $applied, skipped: $skipped}'
+}
+
+cmd_reclaim() { # clear a foreign Lua layout that is winning name resolution
+  hypr_reachable || fail 2 "Hyprland is not reachable"
+  log "reloading the Hyprland config to clear runtime-registered Lua layouts"
+  hyprctl reload >/dev/null 2>&1 || fail 2 "hyprctl reload failed"
+  sleep 1
+  cmd_restore
+  notify low "Centre split" "Registration cleared and the saved splits reapplied"
+}
+
+cmd_status() {
+  hypr_reachable || fail 2 "Hyprland is not reachable"
+  local ws layout preset
+  ws="$(active_workspace)"
+  layout="$(active_layout)"
+  preset="$(saved_preset)"
   jq -n \
     --arg ws "$ws" \
     --arg layout "$layout" \
-    --argjson state "$(cat "$STATE_FILE")" \
-    '{workspace: ($ws | tonumber), layout: $layout, state: $state}'
+    --arg preset "$preset" \
+    --argjson state "$(state_json)" \
+    '{ok: true, workspace: ($ws | tonumber? // 0), layout: $layout, preset: $preset, state: $state}'
 }
 
-cmd="${1:-}"
-case "$cmd" in
-  register) register ;;
-  apply)
-    apply_workspace "${2:-}" "${3:-}"
-    status
-    ;;
-  default)
-    apply_default "${2:-}"
-    status
-    ;;
-  restore) restore ;;
-  status) status ;;
-  *)
-    fail "usage: apply {register|apply <workspace> <layout>|default <layout>|restore|status}"
-    ;;
-esac
+cmd_doctor() { # health report for debugging
+  hypr_reachable || {
+    log "ERROR Hyprland is not reachable"
+    jq -n '{ok: false, hyprland: false, error: "Hyprland is not reachable"}'
+    exit 2
+  }
+
+  local out status fatal attempts register_msg
+  out="$(hypr_eval "dofile([[$LAYOUTS]])")" && status=0 || status=$?
+  fatal="$(printf '%s\n' "$out" \
+    | grep -v 'already registered' \
+    | grep -v '^ok$' \
+    | grep -v '^[[:space:]]*$' || true)"
+  attempts="$(printf '%s\n' "$out" | grep -c 'already registered' || true)"
+
+  local preset preset_status preset_error
+  preset="$(saved_preset)"
+  if hypr_eval "_CENTRE_SPLIT.set_preset(\"$preset\")" >/dev/null; then
+    preset_status="ok"
+    preset_error=""
+  else
+    preset_status="failed"
+    preset_error="the layout is not loaded in Hyprland"
+  fi
+
+  local ws layout now
+  ws="$(active_workspace)"
+  layout="$(active_layout)"
+  now="$(hyprctl getoption general:layout 2>/dev/null | head -n 1 | sed 's/^str:[[:space:]]*//' || true)"
+
+  jq -n \
+    --argjson registerExit "$status" \
+    --argjson attempts "$attempts" \
+    --argjson ws "$ws" \
+    --arg layout "$layout" \
+    --arg now "$now" \
+    --arg preset "$preset" \
+    --arg presetStatus "$preset_status" \
+    --arg presetError "$preset_error" \
+    --arg fatal "$fatal" \
+    --argjson state "$(state_json)" \
+    '{
+      ok: (($registerExit == 0 or $attempts > 0) and $presetStatus == "ok"),
+      hyprland: true,
+      layoutName: "lua:centre-split",
+      registerExit: $registerExit,
+      alreadyRegistered: $attempts,
+      registrationError: $fatal,
+      presetSet: $presetStatus,
+      presetError: $presetError,
+      preset: $preset,
+      defaultLayout: $now,
+      activeWorkspace: $ws,
+      activeWorkspaceLayout: $layout,
+      state: $state,
+      note: "registration and preset state only; run tests/visual_test.py to prove the geometry live"
+    }'
+}
+
+usage() {
+  cat >&2 <<'USAGE'
+usage: apply <command>
+  register                       load layouts.lua into Hyprland and set the preset
+  apply <workspace> [preset]     split a workspace, then verify the result
+  release <workspace>            hand a workspace back to dwindle
+  preset <name>                  switch the shape everywhere the split is on
+  default [preset]               make the split Hyprland's default layout
+  restore                        re-apply saved choices (shell start, after reload)
+  reclaim                        clear a foreign Lua layout, then restore
+  status                         active workspace, layout, preset, saved state
+  doctor                         health report for debugging
+
+presets: qhq | even | thirds | halves      layouts: lua:centre-split | dwindle
+Set CENTRE_SPLIT_NOTIFY=0 to silence the native notifications.
+USAGE
+}
+
+main() {
+  require_deps
+  [[ $# -ge 1 ]] || { usage; exit 1; }
+  case "$1" in
+    register) cmd_register ;;
+    apply) shift; cmd_apply "${1:-}" "${2:-}" ;;
+    release) shift; cmd_release "${1:-}" ;;
+    preset) shift; cmd_preset "${1:-}" ;;
+    default) shift; cmd_default "${1:-}" ;;
+    restore) cmd_restore ;;
+    reclaim) cmd_reclaim ;;
+    status) cmd_status ;;
+    doctor) cmd_doctor ;;
+    -h | --help | help) usage; exit 0 ;;
+    *) usage; exit 1 ;;
+  esac
+}
+
+main "$@"
