@@ -11,6 +11,16 @@ if not plugin then
   error("layouts.lua did not return the module")
 end
 
+-- Every handle_message call below (including the earlier togglesplit/preset
+-- checks) now also writes a persisted state file as a side effect. Point that
+-- at a scratch directory for the whole suite so running this file by hand
+-- never touches the real ~/.config/omarchy; a dedicated block further down
+-- overrides it again pointing at its own throwaway dir to assert on the
+-- contents, then clears the override back to this default on exit.
+local DEFAULT_SCRATCH_DIR = os.tmpname() .. "-centre-split-test-default"
+os.remove(DEFAULT_SCRATCH_DIR)
+plugin.set_config_dir_for_test(DEFAULT_SCRATCH_DIR)
+
 local W, H = 1000, 400
 
 local function mock_ctx(n, w, h)
@@ -195,6 +205,75 @@ do
   end
 end
 
+-- ---- A direct layout_msg dispatch (bypassing `apply` entirely, e.g.
+-- SUPER+J or a hand-typed `hyprctl dispatch`) persists the new preset to the
+-- saved state file, so `apply status` reports the live preset instead of a
+-- stale one. Uses a scratch config dir so the suite never touches the real
+-- ~/.config/omarchy.
+do
+  local scratch = os.tmpname()
+  os.remove(scratch)
+  local scratch_dir = scratch .. "-centre-split-test"
+  plugin.set_config_dir_for_test(scratch_dir)
+
+  plugin.set_preset("qhq")
+  local ctx = mock_ctx(1)
+  local ok = plugin.handle_message(ctx, "togglesplit")
+  check("direct togglesplit accepted", ok == true, tostring(ok))
+  check("direct togglesplit cycles to even", plugin.preset() == "even", plugin.preset())
+
+  local state_file = scratch_dir .. "/centre-split.json"
+  local f = io.open(state_file, "r")
+  check("direct togglesplit persisted a state file", f ~= nil, state_file)
+  if f then
+    local contents = f:read("*a")
+    f:close()
+    check(
+      "persisted state file records the new preset",
+      contents:find('"preset"%s*:%s*"even"') ~= nil,
+      contents
+    )
+  end
+
+  -- `preset <name>` (the message `apply preset`/`apply <ws> <preset>` sends)
+  -- persists the same way.
+  local ok2 = plugin.handle_message(ctx, "preset thirds")
+  check("preset <name> accepted", ok2 == true, tostring(ok2))
+  local f2 = io.open(state_file, "r")
+  if f2 then
+    local contents2 = f2:read("*a")
+    f2:close()
+    check(
+      "preset <name> persists the new value, overwriting the old",
+      contents2:find('"preset"%s*:%s*"thirds"') ~= nil,
+      contents2
+    )
+  end
+
+  -- An unknown message is still rejected, and must not touch the state file.
+  local before = nil
+  do
+    local fb = io.open(state_file, "r")
+    if fb then
+      before = fb:read("*a")
+      fb:close()
+    end
+  end
+  plugin.handle_message(ctx, "not-a-real-message")
+  local after = nil
+  do
+    local fa = io.open(state_file, "r")
+    if fa then
+      after = fa:read("*a")
+      fa:close()
+    end
+  end
+  check("rejected message leaves the persisted state untouched", before == after)
+
+  os.execute("rm -rf " .. scratch_dir)
+  plugin.set_config_dir_for_test(DEFAULT_SCRATCH_DIR)
+end
+
 -- ---- A genuinely unknown message is still rejected (not silently accepted).
 do
   plugin.set_preset("qhq")
@@ -208,4 +287,5 @@ if fails > 0 then
   print(string.format("%d check(s) failed", fails))
   os.exit(1)
 end
+os.execute("rm -rf " .. DEFAULT_SCRATCH_DIR)
 print("all passed")

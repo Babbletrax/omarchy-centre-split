@@ -235,6 +235,65 @@ local function shell_quote(s)
   return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
 end
 
+-- Persistence sync: a layout_msg dispatched straight at Hyprland (e.g. SUPER+J
+-- / togglesplit, or `hyprctl dispatch 'hl.dsp.layout("even")'` typed by hand)
+-- only ever mutates this file's in-process `state` table. It never goes
+-- through `apply`, so without this, `apply status` -- which reads
+-- ~/.config/omarchy/centre-split.json -- keeps reporting the preset from
+-- before the direct dispatch even though the compositor has already retiled.
+-- Every successful preset change in handle_message therefore also writes the
+-- saved state file, mirroring `apply`'s own write_state(): read-merge-write
+-- through a temp file plus `mv`, so a mid-write crash never corrupts the
+-- saved JSON and fields `apply` owns (default, workspaces) are preserved.
+local override_config_dir = nil
+
+-- Test-only hook: point persistence at a scratch directory instead of the
+-- real ~/.config/omarchy, so the regression suite can assert on the file
+-- written by a direct dispatch without touching the user's actual state.
+function M.set_config_dir_for_test(path)
+  override_config_dir = path
+end
+
+local function state_paths()
+  if override_config_dir then
+    return override_config_dir, override_config_dir .. "/centre-split.json"
+  end
+  local xdg = os.getenv("XDG_CONFIG_HOME")
+  local home = os.getenv("HOME") or "/root"
+  local config_dir = ((xdg and xdg ~= "") and xdg or (home .. "/.config")) .. "/omarchy"
+  return config_dir, config_dir .. "/centre-split.json"
+end
+
+local function persist_preset(name)
+  if os.getenv("CENTRE_SPLIT_NO_PERSIST") == "1" then
+    return
+  end
+  local config_dir, state_file = state_paths()
+  local qdir, qfile, qname = shell_quote(config_dir), shell_quote(state_file), shell_quote(name)
+  -- Merge onto the existing file when it is valid JSON; otherwise start from
+  -- the same empty shape `apply`'s state_json() falls back to, so a missing
+  -- or corrupt file never blocks the sync.
+  local cmd = "mkdir -p " .. qdir .. " 2>/dev/null; "
+    .. "tmp=$(mktemp " .. qdir .. "/centre-split.XXXXXX.json 2>/dev/null) || exit 0; "
+    .. "if [ -s " .. qfile .. " ] && jq -e . " .. qfile .. " >/dev/null 2>&1; then "
+    .. "jq --arg preset " .. qname .. " '.preset = $preset' " .. qfile .. " >\"$tmp\" 2>/dev/null; "
+    .. "else "
+    .. "jq -n --arg preset " .. qname .. " '{preset: $preset, default: \"\", workspaces: {}}' >\"$tmp\" 2>/dev/null; "
+    .. "fi; "
+    .. "if [ -s \"$tmp\" ] && jq -e . \"$tmp\" >/dev/null 2>&1; then mv \"$tmp\" " .. qfile .. "; else rm -f \"$tmp\"; fi"
+  pcall(os.execute, cmd)
+end
+
+-- Every branch of handle_message that changes the live preset routes through
+-- here, so a direct dispatch (bypassing apply entirely) and an apply-driven
+-- one (which also calls write_state itself; the two writes agree) both leave
+-- the saved file in step with what the compositor is actually showing.
+local function apply_preset(name)
+  state.preset = name
+  persist_preset(name)
+  return true
+end
+
 -- Surface a rejected layout_msg as a real toast. layout_msg rejections (a
 -- non-true return) are swallowed by Hyprland's dispatch pipeline -- no crash,
 -- no exception, and the apply script's own notify() never runs because this
@@ -262,14 +321,12 @@ local function handle_message(ctx, msg)
   local text = tostring(msg or "")
   local command = text:match("^(%S+)") or ""
   if M.is_preset(command) then
-    state.preset = command
-    return true
+    return apply_preset(command)
   end
   if command == "preset" then
     local name = text:match("^%S+%s+(%S+)")
     if M.is_preset(name) then
-      state.preset = name
-      return true
+      return apply_preset(name)
     end
   end
   if command == "reapply" then
@@ -281,8 +338,7 @@ local function handle_message(ctx, msg)
     -- orientation) this layout has no equivalent for; instead of rejecting it
     -- outright, cycle to the next preset in M.CYCLE_ORDER so the keybind does
     -- something useful on a centre-split workspace too.
-    state.preset = M.next_preset(state.preset)
-    return true
+    return apply_preset(M.next_preset(state.preset))
   end
   local rejection = "centre-split: expected " .. table.concat(M.PRESET_NAMES, ", ") .. ", or preset <name>"
   local reason = (text == "" and rejection) or ("\"" .. text .. "\" not supported here \226\128\148 " .. rejection)
