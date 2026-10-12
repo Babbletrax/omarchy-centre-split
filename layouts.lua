@@ -216,6 +216,33 @@ local function recalculate(ctx)
   M.place(ctx, spec)
 end
 
+local function shell_quote(s)
+  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
+
+-- Surface a rejected layout_msg as a real toast. layout_msg rejections (a
+-- non-true return) are swallowed by Hyprland's dispatch pipeline -- no crash,
+-- no exception, and the apply script's own notify() never runs because this
+-- path never goes through apply. Without this, e.g. SUPER+J (togglesplit,
+-- a dwindle-only concept Centre Split doesn't implement) fails completely
+-- silently. Only fires when actually loaded inside Hyprland (hl present), so
+-- the plain-Lua unit tests never shell out.
+local function notify_reject(message)
+  if not hl then
+    return
+  end
+  if os.getenv("CENTRE_SPLIT_NOTIFY") == "0" then
+    return
+  end
+  local headline = shell_quote("Centre split")
+  local body = shell_quote(message)
+  local cmd = "command -v omarchy-notification-send >/dev/null 2>&1 && "
+    .. "omarchy-notification-send -u normal -t 6000 " .. headline .. " " .. body .. " >/dev/null 2>&1 || "
+    .. "(command -v notify-send >/dev/null 2>&1 && "
+    .. "notify-send -u normal -t 6000 -a 'Centre Split' " .. headline .. " " .. body .. " >/dev/null 2>&1) || true"
+  pcall(os.execute, cmd)
+end
+
 local function handle_message(ctx, msg)
   local text = tostring(msg or "")
   local command = text:match("^(%S+)") or ""
@@ -234,7 +261,10 @@ local function handle_message(ctx, msg)
     -- Handy from a keybinding: forces the layout to run again.
     return true
   end
-  return "centre-split: expected " .. table.concat(M.PRESET_NAMES, ", ") .. ", or preset <name>"
+  local rejection = "centre-split: expected " .. table.concat(M.PRESET_NAMES, ", ") .. ", or preset <name>"
+  local reason = (text == "" and rejection) or ("\"" .. text .. "\" not supported here \226\128\148 " .. rejection)
+  notify_reject(reason)
+  return rejection
 end
 
 -- Idempotent: Hyprland rejects a repeat registration with a Lua error, and this
