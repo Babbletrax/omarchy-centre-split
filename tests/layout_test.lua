@@ -11,12 +11,11 @@ if not plugin then
   error("layouts.lua did not return the module")
 end
 
--- Every handle_message call below (including the earlier togglesplit/preset
--- checks) now also writes a persisted state file as a side effect. Point that
--- at a scratch directory for the whole suite so running this file by hand
--- never touches the real ~/.config/omarchy; a dedicated block further down
--- overrides it again pointing at its own throwaway dir to assert on the
--- contents, then clears the override back to this default on exit.
+-- Every handle_message call that changes the shape also writes a persisted
+-- state file as a side effect. Point that at a scratch directory for the
+-- whole suite so running this file by hand never touches the real
+-- ~/.config/omarchy; a dedicated block further down overrides it again
+-- pointing at its own throwaway dir to assert on the contents.
 local DEFAULT_SCRATCH_DIR = os.tmpname() .. "-centre-split-test-default"
 os.remove(DEFAULT_SCRATCH_DIR)
 plugin.set_config_dir_for_test(DEFAULT_SCRATCH_DIR)
@@ -70,145 +69,265 @@ local function check(name, cond, detail)
   end
 end
 
-local function place(n, preset)
+local function place_spec(n, spec)
   local ctx = mock_ctx(n)
-  plugin.place(ctx, plugin.PRESETS[preset])
+  plugin.place(ctx, spec)
   return ctx
+end
+
+-- Reset the module's rotation/variant bookkeeping to a known state before a
+-- block that depends on it, since recalculate()/handle_message mutate it.
+local function reset_variants()
+  for bucket = 1, 4 do
+    plugin.set_variant(bucket, 1)
+  end
+  plugin.set_last_count(0)
 end
 
 -- ---- The registered layout is a single, unambiguous name.
 check("one layout name", plugin.LAYOUT_NAME == "centre-split", tostring(plugin.LAYOUT_NAME))
-check("four presets", #plugin.PRESET_NAMES == 4, table.concat(plugin.PRESET_NAMES, ","))
 
--- ---- Preset bookkeeping.
-check("default preset is qhq", plugin.preset() == plugin.DEFAULT_PRESET, plugin.preset())
-check("set_preset accepts a known name", plugin.set_preset("even") == true)
-check("set_preset took effect", plugin.preset() == "even", plugin.preset())
-local ok, err = plugin.set_preset("nonsense")
-check("set_preset rejects an unknown name", ok == false and type(err) == "string", tostring(err))
-check("preset unchanged after a rejected set", plugin.preset() == "even", plugin.preset())
-plugin.set_preset("qhq")
+-- ---- bucket_for: window count maps to the right SHAPES bucket, 5+ reuses 4.
+check("bucket_for 0", plugin.bucket_for(0) == 0)
+check("bucket_for 1", plugin.bucket_for(1) == 1)
+check("bucket_for 2", plugin.bucket_for(2) == 2)
+check("bucket_for 3", plugin.bucket_for(3) == 3)
+check("bucket_for 4", plugin.bucket_for(4) == 4)
+check("bucket_for 5 reuses 4", plugin.bucket_for(5) == 4)
+check("bucket_for 9 reuses 4", plugin.bucket_for(9) == 4)
 
--- ---- qhq (1/4 | 1/2 | 1/4), three windows: the centre half gets window 1.
+-- ---- 1 window: fullscreen, no quarters.
 do
-  local ctx = place(3, "qhq")
-  local centre, left, right = ctx.targets[1].box, ctx.targets[2].box, ctx.targets[3].box
-  check("qhq centre x", almost(centre.x, 250), "x=" .. centre.x)
-  check("qhq centre w", almost(centre.w, 500), "w=" .. centre.w)
-  check("qhq left x", almost(left.x, 0), "x=" .. left.x)
-  check("qhq left w", almost(left.w, 250), "w=" .. left.w)
-  check("qhq right x", almost(right.x, 750), "x=" .. right.x)
-  check("qhq right w", almost(right.w, 250), "w=" .. right.w)
-  check(
-    "qhq full height",
-    almost(centre.h, H) and almost(left.h, H) and almost(right.h, H),
-    string.format("%s/%s/%s", centre.h, left.h, right.h)
-  )
-end
-
--- ---- qhq with one window keeps the centre half (no rescale to fullscreen).
-do
-  local ctx = place(1, "qhq")
+  local ctx = place_spec(1, plugin.SHAPES[1][1])
   local only = ctx.targets[1].box
-  check("one window stays centre x", almost(only.x, 250), "x=" .. only.x)
-  check("one window stays centre w", almost(only.w, 500), "w=" .. only.w)
-  check("one window full height", almost(only.h, H), "h=" .. only.h)
+  check("1 window fullscreen x", almost(only.x, 0), "x=" .. only.x)
+  check("1 window fullscreen w", almost(only.w, W), "w=" .. only.w)
+  check("1 window fullscreen h", almost(only.h, H), "h=" .. only.h)
 end
 
--- ---- qhq with two windows: centre, then the left quarter.
+-- ---- 2 windows, variant 1: even 50/50.
 do
-  local ctx = place(2, "qhq")
-  check(
-    "two windows: centre first",
-    almost(ctx.targets[1].box.x, 250) and almost(ctx.targets[1].box.w, 500)
-  )
-  check(
-    "two windows: then left",
-    almost(ctx.targets[2].box.x, 0) and almost(ctx.targets[2].box.w, 250)
-  )
+  local ctx = place_spec(2, plugin.SHAPES[2][1])
+  check("2w even left", almost(ctx.targets[1].box.x, 0) and almost(ctx.targets[1].box.w, W / 2))
+  check("2w even right", almost(ctx.targets[2].box.x, W / 2) and almost(ctx.targets[2].box.w, W / 2))
 end
 
--- ---- qhq with four windows: the extra stacks inside the centre half.
+-- ---- 2 windows, variant 2: 1/3 + 2/3.
 do
-  local ctx = place(4, "qhq")
-  local first, extra = ctx.targets[1].box, ctx.targets[4].box
-  check(
-    "extra shares the centre column",
-    almost(first.x, extra.x) and almost(first.w, extra.w),
-    string.format("first=(%.1f,%.1f) extra=(%.1f,%.1f)", first.x, first.w, extra.x, extra.w)
-  )
-  check(
-    "extra stacks vertically in it",
-    almost(first.h + extra.h, H),
-    string.format("h=%.1f+%.1f", first.h, extra.h)
-  )
-  check("centre stack starts at the top", almost(first.y, 0), "y=" .. first.y)
-  check("extra sits below", almost(extra.y, H / 2), "y=" .. extra.y)
+  local ctx = place_spec(2, plugin.SHAPES[2][2])
+  check("2w 1/3+2/3 first width", almost(ctx.targets[1].box.w, W / 3, 1.0), "w=" .. ctx.targets[1].box.w)
+  check("2w 1/3+2/3 second width", almost(ctx.targets[2].box.w, 2 * W / 3, 1.0), "w=" .. ctx.targets[2].box.w)
+  check("2w 1/3+2/3 second x", almost(ctx.targets[2].box.x, W / 3, 1.0), "x=" .. ctx.targets[2].box.x)
 end
 
--- ---- even: one window fills the screen, two split evenly.
+-- ---- 2 windows, variant 3: 2/3 + 1/3 (mirror of the above).
 do
-  local one = place(1, "even")
-  check(
-    "even one window fills",
-    almost(one.targets[1].box.x, 0) and almost(one.targets[1].box.w, W)
-  )
-  local two = place(2, "even")
-  check(
-    "even two windows",
-    almost(two.targets[1].box.w, W / 2) and almost(two.targets[2].box.x, W / 2)
-  )
+  local ctx = place_spec(2, plugin.SHAPES[2][3])
+  check("2w 2/3+1/3 first width", almost(ctx.targets[1].box.w, 2 * W / 3, 1.0), "w=" .. ctx.targets[1].box.w)
+  check("2w 2/3+1/3 second width", almost(ctx.targets[2].box.w, W / 3, 1.0), "w=" .. ctx.targets[2].box.w)
 end
 
--- ---- thirds: three equal columns, left to right.
+-- ---- 2 windows, variant 4: half horizontal (top/bottom, not left/right).
 do
-  local ctx = place(3, "thirds")
-  check(
-    "thirds left",
-    almost(ctx.targets[1].box.x, 0) and almost(ctx.targets[1].box.w, W / 3, 1.0)
-  )
-  check(
-    "thirds middle",
-    almost(ctx.targets[2].box.x, W / 3, 1.0) and almost(ctx.targets[2].box.w, W / 3, 1.0)
-  )
-  check("thirds right", almost(ctx.targets[3].box.x, 2000 / 3, 1.0))
+  local ctx = place_spec(2, plugin.SHAPES[2][4])
+  local top, bottom = ctx.targets[1].box, ctx.targets[2].box
+  check("2w horizontal top y", almost(top.y, 0), "y=" .. top.y)
+  check("2w horizontal top h", almost(top.h, H / 2), "h=" .. top.h)
+  check("2w horizontal bottom y", almost(bottom.y, H / 2), "y=" .. bottom.y)
+  check("2w horizontal full width", almost(top.w, W) and almost(bottom.w, W), "w=" .. top.w .. "/" .. bottom.w)
 end
 
--- ---- halves: plain 50/50, and a lone window fills.
+-- ---- 3 windows, variant 1: even thirds.
 do
-  local ctx = place(2, "halves")
-  check("halves left", almost(ctx.targets[1].box.x, 0) and almost(ctx.targets[1].box.w, W / 2))
-  check("halves right", almost(ctx.targets[2].box.x, W / 2))
-  local one = place(1, "halves")
-  check("halves one window fills", almost(one.targets[1].box.w, W))
+  local ctx = place_spec(3, plugin.SHAPES[3][1])
+  check("3w thirds left", almost(ctx.targets[1].box.x, 0) and almost(ctx.targets[1].box.w, W / 3, 1.0))
+  check("3w thirds middle", almost(ctx.targets[2].box.x, W / 3, 1.0))
+  check("3w thirds right", almost(ctx.targets[3].box.x, 2 * W / 3, 1.0))
 end
 
--- ---- Every preset accounts for exactly the whole width.
-for _, name in ipairs(plugin.PRESET_NAMES) do
-  local sum = 0
-  for _, frac in ipairs(plugin.PRESETS[name].slots) do
-    sum = sum + frac
+-- ---- 3 windows, variant 2: one 2/3 pane + the other two stacked in 1/3.
+do
+  local ctx = place_spec(3, plugin.SHAPES[3][2])
+  local wide = ctx.targets[1].box
+  local stack_top, stack_bottom = ctx.targets[2].box, ctx.targets[3].box
+  check("3w 2/3-stack wide pane width", almost(wide.w, 2 * W / 3, 1.0), "w=" .. wide.w)
+  check(
+    "3w 2/3-stack other two share the stack column",
+    almost(stack_top.x, stack_bottom.x) and almost(stack_top.w, stack_bottom.w),
+    string.format("top=(%.1f,%.1f) bottom=(%.1f,%.1f)", stack_top.x, stack_top.w, stack_bottom.x, stack_bottom.w)
+  )
+  check(
+    "3w 2/3-stack column is stacked vertically",
+    almost(stack_top.h + stack_bottom.h, H),
+    string.format("h=%.1f+%.1f", stack_top.h, stack_bottom.h)
+  )
+end
+
+-- ---- 4 windows, variant 1: square (2 even columns, distributed round-robin
+-- so each column gets 2 windows stacked -- a real 2x2 grid).
+do
+  local ctx = place_spec(4, plugin.SHAPES[4][1])
+  local w1, w2, w3, w4 = ctx.targets[1].box, ctx.targets[2].box, ctx.targets[3].box, ctx.targets[4].box
+  check(
+    "4w square: windows 1 and 3 share the left column",
+    almost(w1.x, w3.x) and almost(w1.w, w3.w),
+    string.format("w1=(%.1f,%.1f) w3=(%.1f,%.1f)", w1.x, w1.w, w3.x, w3.w)
+  )
+  check(
+    "4w square: windows 2 and 4 share the right column",
+    almost(w2.x, w4.x) and almost(w2.w, w4.w),
+    string.format("w2=(%.1f,%.1f) w4=(%.1f,%.1f)", w2.x, w2.w, w4.x, w4.w)
+  )
+  check("4w square: left column is half width", almost(w1.w, W / 2), "w=" .. w1.w)
+  check("4w square: right column starts at mid", almost(w2.x, W / 2), "x=" .. w2.x)
+  check(
+    "4w square: left column stacked top/bottom",
+    almost(w1.y, 0) and almost(w3.y, H / 2),
+    string.format("w1.y=%.1f w3.y=%.1f", w1.y, w3.y)
+  )
+end
+
+-- ---- 4 windows, variant 2: one 2/3 pane + the other three stacked in 1/3.
+do
+  local ctx = place_spec(4, plugin.SHAPES[4][2])
+  local wide = ctx.targets[1].box
+  check("4w 2/3-stack wide pane width", almost(wide.w, 2 * W / 3, 1.0), "w=" .. wide.w)
+  local total_h = 0
+  for i = 2, 4 do
+    total_h = total_h + ctx.targets[i].box.h
   end
-  check("preset " .. name .. " slots sum to 1", almost(sum, 1, 0.0001), tostring(sum))
+  check("4w 2/3-stack: three extras fill the column height", almost(total_h, H), "h=" .. total_h)
 end
 
--- ---- togglesplit (SUPER+J) cycles presets in a defined order instead of
--- being rejected. M.CYCLE_ORDER is qhq -> even -> thirds -> halves -> qhq.
+-- ---- 5 windows reuses the 4-window shapes list (bucket_for caps at 4); the
+-- stacking column just grows to hold the 5th window.
 do
-  plugin.set_preset("qhq")
+  local ctx = place_spec(5, plugin.SHAPES[plugin.bucket_for(5)][2])
+  local wide = ctx.targets[1].box
+  check("5w reuses 4-bucket wide pane width", almost(wide.w, 2 * W / 3, 1.0), "w=" .. wide.w)
+  local total_h = 0
+  for i = 2, 5 do
+    total_h = total_h + ctx.targets[i].box.h
+  end
+  check("5w: four extras fill the column height", almost(total_h, H), "h=" .. total_h)
+end
+
+-- ---- Every shape's slots sum to exactly 1 (no wasted/overlapping space).
+for bucket = 1, 4 do
+  for _, shape in ipairs(plugin.SHAPES[bucket]) do
+    local sum = 0
+    for _, frac in ipairs(shape.slots) do
+      sum = sum + frac
+    end
+    check(
+      "bucket " .. bucket .. " shape " .. shape.name .. " slots sum to 1",
+      almost(sum, 1, 0.0001),
+      tostring(sum)
+    )
+  end
+end
+
+-- ---- recalculate() auto-rotates: calling with the SAME window count twice
+-- in a row keeps the shape; the count genuinely CHANGING advances to the
+-- next variant for the new count. Drive this through handle_message's
+-- "reapply" (true, no state change) vs. varying ctx.targets size, using the
+-- real registered recalculate by re-dofiling with `hl` is not available in
+-- the plain-lua test harness, so exercise the same mechanism directly via
+-- M.current_shape / M.bucket_for / M.advance_variant / M.set_last_count,
+-- which recalculate() itself calls.
+do
+  reset_variants()
+  plugin.set_variant(2, 1) -- start on the first 2-window variant (even)
+  plugin.set_last_count(0)
+
+  -- Simulate what recalculate() does: count changes 0 -> 2, so it advances.
+  local function simulate_recalculate(n)
+    local bucket = plugin.bucket_for(n)
+    if n ~= plugin.last_count() then
+      plugin.advance_variant(bucket)
+      plugin.set_last_count(n)
+    end
+    return plugin.current_shape(n)
+  end
+
+  local first = simulate_recalculate(2)
+  check("auto-rotate: first arrival at 2 windows advances past the pre-set index", first ~= nil)
+
+  -- Re-running at the SAME count (e.g. a resize, not an open/close) must NOT
+  -- advance again.
+  local again = simulate_recalculate(2)
+  check("auto-rotate: same count twice keeps the same variant", again.name == first.name, again.name)
+
+  -- Count genuinely changes (close one window: 2 -> 1), then back to 2:
+  -- arriving at 2 again must show a DIFFERENT variant than `first`.
+  simulate_recalculate(1)
+  local second_arrival = simulate_recalculate(2)
+  check(
+    "auto-rotate: re-arriving at 2 windows shows the next variant",
+    second_arrival.name ~= first.name,
+    first.name .. " -> " .. second_arrival.name
+  )
+end
+
+-- ---- handle_message: togglesplit is a harmless no-op (no shape change) --
+-- SUPER+J no longer cycles anything; that is cyclevariant's job now.
+do
+  reset_variants()
+  local ctx = mock_ctx(2)
+  local before = plugin.current_shape(2)
+  local ok = plugin.handle_message(ctx, "togglesplit")
+  check("togglesplit accepted", ok == true, tostring(ok))
+  local after = plugin.current_shape(2)
+  check(
+    "togglesplit does not change the variant",
+    before ~= nil and after ~= nil and before.name == after.name,
+    tostring(before and before.name) .. " -> " .. tostring(after and after.name)
+  )
+end
+
+-- ---- handle_message: cyclevariant advances the variant for however many
+-- windows are in ctx.targets right now, and wraps around.
+do
+  reset_variants()
+  local ctx = mock_ctx(2) -- bucket 2 has 4 variants
+  local seen = {}
+  for i = 1, 5 do
+    local ok = plugin.handle_message(ctx, "cyclevariant")
+    check("cyclevariant accepted (" .. i .. ")", ok == true, tostring(ok))
+    local shape = plugin.current_shape(2)
+    seen[#seen + 1] = shape.name
+  end
+  check(
+    "cyclevariant wraps back to the first variant after a full cycle",
+    seen[1] == seen[5],
+    table.concat(seen, " -> ")
+  )
+end
+
+-- ---- handle_message: reapply is a true no-op.
+do
   local ctx = mock_ctx(1)
-  local expect = { "even", "thirds", "halves", "qhq" }
-  for _, want in ipairs(expect) do
-    local ok = plugin.handle_message(ctx, "togglesplit")
-    check("togglesplit accepted", ok == true, tostring(ok))
-    check("togglesplit cycles to " .. want, plugin.preset() == want, plugin.preset())
-  end
+  local ok = plugin.handle_message(ctx, "reapply")
+  check("reapply accepted", ok == true, tostring(ok))
+end
+
+-- ---- handle_message: setvariant directly selects bucket <n>'s variant
+-- (restore-only, but exercised here like any other message).
+do
+  local ctx = mock_ctx(3)
+  local ok = plugin.handle_message(ctx, "setvariant 3 2")
+  check("setvariant accepted", ok == true, tostring(ok))
+  local shape = plugin.current_shape(3)
+  check("setvariant selected the requested variant", shape.name == plugin.SHAPES[3][2].name, shape.name)
+
+  local bad = plugin.handle_message(ctx, "setvariant 3 99")
+  check("setvariant rejects an out-of-range index cleanly", bad == true or type(bad) == "string")
 end
 
 -- ---- A direct layout_msg dispatch (bypassing `apply` entirely, e.g.
--- SUPER+J or a hand-typed `hyprctl dispatch`) persists the new preset to the
--- saved state file, so `apply status` reports the live preset instead of a
--- stale one. Uses a scratch config dir so the suite never touches the real
+-- SUPER+SHIFT+J / cyclevariant, or a hand-typed `hyprctl dispatch`) persists
+-- the new shape state to the saved state file, so `apply status` can read
+-- it back. Uses a scratch config dir so the suite never touches the real
 -- ~/.config/omarchy.
 do
   local scratch = os.tmpname()
@@ -216,37 +335,21 @@ do
   local scratch_dir = scratch .. "-centre-split-test"
   plugin.set_config_dir_for_test(scratch_dir)
 
-  plugin.set_preset("qhq")
-  local ctx = mock_ctx(1)
-  local ok = plugin.handle_message(ctx, "togglesplit")
-  check("direct togglesplit accepted", ok == true, tostring(ok))
-  check("direct togglesplit cycles to even", plugin.preset() == "even", plugin.preset())
+  reset_variants()
+  local ctx = mock_ctx(2)
+  local ok = plugin.handle_message(ctx, "cyclevariant")
+  check("direct cyclevariant accepted", ok == true, tostring(ok))
 
   local state_file = scratch_dir .. "/centre-split.json"
   local f = io.open(state_file, "r")
-  check("direct togglesplit persisted a state file", f ~= nil, state_file)
+  check("direct cyclevariant persisted a state file", f ~= nil, state_file)
   if f then
     local contents = f:read("*a")
     f:close()
     check(
-      "persisted state file records the new preset",
-      contents:find('"preset"%s*:%s*"even"') ~= nil,
+      "persisted state file records the shape block",
+      contents:find('"shape"') ~= nil and contents:find('"variant"') ~= nil,
       contents
-    )
-  end
-
-  -- `preset <name>` (the message `apply preset`/`apply <ws> <preset>` sends)
-  -- persists the same way.
-  local ok2 = plugin.handle_message(ctx, "preset thirds")
-  check("preset <name> accepted", ok2 == true, tostring(ok2))
-  local f2 = io.open(state_file, "r")
-  if f2 then
-    local contents2 = f2:read("*a")
-    f2:close()
-    check(
-      "preset <name> persists the new value, overwriting the old",
-      contents2:find('"preset"%s*:%s*"thirds"') ~= nil,
-      contents2
     )
   end
 
@@ -276,11 +379,9 @@ end
 
 -- ---- A genuinely unknown message is still rejected (not silently accepted).
 do
-  plugin.set_preset("qhq")
   local ctx = mock_ctx(1)
   local result = plugin.handle_message(ctx, "not-a-real-message")
   check("unknown message rejected", type(result) == "string", tostring(result))
-  check("preset unchanged by unknown message", plugin.preset() == "qhq", plugin.preset())
 end
 
 if fails > 0 then

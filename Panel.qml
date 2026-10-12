@@ -23,7 +23,7 @@ Panel {
 
   readonly property var widget: hostWidget
   readonly property int workspaceId: widget ? widget.workspaceId : 0
-  readonly property string preset: widget ? widget.preset : "qhq"
+  readonly property var shape: widget ? widget.shape : ({ windows: 0, bucket: 0, variant: 0 })
   readonly property string layout: widget ? widget.layout : "dwindle"
   readonly property bool splitActive: layout === Model.LAYOUT
   readonly property string lastError: widget ? widget.lastError : ""
@@ -50,8 +50,8 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function refresh(): void { root.refresh() }
-    function shape(preset: string): void { if (root.widget) root.widget.applyShape(preset) }
-    function apply(): void { if (root.widget) root.widget.applyToWorkspace("current", root.preset) }
+    function shape(cmd: string): void { if (root.widget) { if (cmd === "cyclevariant") root.widget.cycleVariant(); else root.widget.applyToWorkspace("current") } }
+    function apply(): void { if (root.widget) root.widget.applyToWorkspace("current") }
     function release(): void { if (root.widget) root.widget.releaseWorkspace("current") }
     function reapply(): void { if (root.widget) root.widget.reapply() }
   }
@@ -95,7 +95,7 @@ Panel {
           width: parent.width
           wrapMode: Text.WordWrap
           text: "Workspace " + (root.workspaceId || "?")
-            + (root.splitActive ? " is split " + Model.labelFor(root.preset) : " is on dwindle")
+            + (root.splitActive ? " is split: " + Model.shapeSummary(root.shape) : " is on dwindle")
             + "."
           color: root.contentForeground
           font.family: root.contentFontFamily
@@ -105,14 +105,15 @@ Panel {
         Text {
           width: parent.width
           wrapMode: Text.WordWrap
-          text: "Dwindle puts a half on one side and two quarters stacked on the other. 1/4 · 1/2 · 1/4 keeps the half in the middle and gives it to the first window. Picking a shape splits this workspace with it."
+          text: "The shape is picked automatically by how many windows are open, and rotates to the next variant each time that count changes. Cycle manually with Super+Shift+J, or the button below."
           color: Qt.darker(root.contentForeground, 1.2)
           font.family: root.contentFontFamily
           font.pixelSize: Style.font.body
         }
 
-        // ---- Shape. One layout is registered with Hyprland, so a preset
-        //      applies everywhere the split is switched on.
+        // ---- Shape. One layout is registered with Hyprland; the shape for
+        //      the current window count is reported here, read-only, plus a
+        //      manual cycle action (mirrors SUPER+SHIFT+J / cyclevariant).
         Text {
           width: parent.width
           text: "SHAPE"
@@ -122,80 +123,72 @@ Panel {
           font.letterSpacing: 1
         }
 
-        Repeater {
-          model: Model.presets()
+        Rectangle {
+          id: shapeCard
+          width: body.width
+          height: shapeRow.implicitHeight + Style.space(14)
+          radius: 6
+          color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.1)
+          border.width: 1
+          border.color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.18)
 
-          Rectangle {
-            id: card
-            required property var modelData
-            width: body.width
-            height: row.implicitHeight + Style.space(14)
-            radius: 6
-            readonly property bool selected: root.preset === modelData.id
-            color: selected
-              ? Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.16)
-              : Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.06)
-            border.width: 1
-            border.color: Qt.rgba(root.contentForeground.r, root.contentForeground.g, root.contentForeground.b, 0.18)
+          MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+            onClicked: if (root.widget) root.widget.cycleVariant()
+          }
 
-            MouseArea {
-              anchors.fill: parent
-              cursorShape: Qt.PointingHandCursor
-              onClicked: if (root.widget) root.widget.applyShape(card.modelData.id)
-            }
+          Row {
+            id: shapeRow
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(12)
+            anchors.rightMargin: Style.space(12)
+            spacing: Style.space(12)
 
-            Row {
-              id: row
-              anchors.left: parent.left
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              anchors.leftMargin: Style.space(12)
-              anchors.rightMargin: Style.space(12)
-              spacing: Style.space(12)
-
-              Canvas {
-                width: 72
-                height: 26
-                onPaint: {
-                  var ctx = getContext("2d")
-                  ctx.reset()
-                  var fg = root.contentForeground
-                  ctx.strokeStyle = fg
-                  ctx.fillStyle = Qt.rgba(fg.r, fg.g, fg.b, 0.35)
-                  ctx.lineWidth = 1
-                  var gap = 2
-                  var x = 0.5
-                  var slots = card.modelData.slots
-                  var inner = width - 1 - gap * (slots.length - 1)
-                  for (var i = 0; i < slots.length; i++) {
-                    var w = inner * slots[i]
-                    ctx.fillRect(x, 0.5, w, height - 1)
-                    ctx.strokeRect(x, 0.5, w, height - 1)
-                    x += w + gap
-                  }
+            Canvas {
+              width: 72
+              height: 26
+              onPaint: {
+                var ctx = getContext("2d")
+                ctx.reset()
+                var fg = root.contentForeground
+                ctx.strokeStyle = fg
+                ctx.fillStyle = Qt.rgba(fg.r, fg.g, fg.b, 0.35)
+                ctx.lineWidth = 1
+                var n = Math.max(1, Number(root.shape && root.shape.bucket) || 1)
+                var gap = 2
+                var x = 0.5
+                var inner = width - 1 - gap * (n - 1)
+                var w = inner / n
+                for (var i = 0; i < n; i++) {
+                  ctx.fillRect(x, 0.5, w, height - 1)
+                  ctx.strokeRect(x, 0.5, w, height - 1)
+                  x += w + gap
                 }
               }
+            }
 
-              Column {
-                width: row.width - 72 - Style.space(12)
-                spacing: Style.space(2)
+            Column {
+              width: shapeRow.width - 72 - Style.space(12)
+              spacing: Style.space(2)
 
-                Text {
-                  width: parent.width
-                  text: card.modelData.name
-                  color: root.contentForeground
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.body
-                }
+              Text {
+                width: parent.width
+                text: Model.shapeSummary(root.shape)
+                color: root.contentForeground
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.body
+              }
 
-                Text {
-                  width: parent.width
-                  wrapMode: Text.WordWrap
-                  text: card.modelData.detail
-                  color: Qt.darker(root.contentForeground, 1.3)
-                  font.family: root.contentFontFamily
-                  font.pixelSize: Style.font.caption
-                }
+              Text {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                text: "Click to cycle to the next shape for this window count."
+                color: Qt.darker(root.contentForeground, 1.3)
+                font.family: root.contentFontFamily
+                font.pixelSize: Style.font.caption
               }
             }
           }
@@ -216,7 +209,7 @@ Panel {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: if (root.widget) root.widget.applyToWorkspace("current", root.preset)
+              onClicked: if (root.widget) root.widget.applyToWorkspace("current")
             }
           }
 
@@ -251,7 +244,7 @@ Panel {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              onClicked: if (root.widget) root.widget.setDefault(root.preset)
+              onClicked: if (root.widget) root.widget.setDefault()
             }
           }
 

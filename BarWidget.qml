@@ -13,7 +13,7 @@ BarWidget {
 
   property int workspaceId: 0
   property string layout: "dwindle"
-  property string preset: "qhq"
+  property var shape: ({ windows: 0, bucket: 0, variant: 0 })
   property bool busy: false
   property string lastError: ""
   property string lastEvent: ""
@@ -25,7 +25,7 @@ BarWidget {
   readonly property string helperPath: Qt.resolvedUrl("apply").toString().replace(/^file:\/\//, "")
 
   readonly property bool splitActive: root.layout === Model.LAYOUT
-  readonly property string displayText: root.splitActive ? Model.labelFor(root.preset) : "Split"
+  readonly property string displayText: root.splitActive ? Model.shapeSummary(root.shape) : "Split"
 
   // ---- Logging in the shape the first-party services use, so plugin trouble
   //      shows up in `omarchy debug` and in the shell log.
@@ -65,7 +65,7 @@ BarWidget {
     if (!statusProcess.running) statusProcess.running = true
   }
 
-  function applyToWorkspace(workspace, preset) {
+  function applyToWorkspace(workspace) {
     // "current" is resolved by the helper at call time: the widget's cached
     // workspace id goes stale the moment you switch workspaces, and acting on
     // a stale id splits a workspace you are not even looking at.
@@ -76,20 +76,13 @@ BarWidget {
       root.logEvent("apply-skipped", "no workspace")
       return
     }
-    var args = ["apply", ws]
-    if (preset !== undefined && preset !== "") args.push(String(preset))
-    root.runHelper(args)
+    root.runHelper(["apply", ws])
   }
 
-  function applyShape(preset) {
-    // Picking a shape means "give this workspace that shape": applying it to the
-    // focused workspace is also what lets the preset message reach the layout,
-    // because messages only go to the focused workspace's layout.
-    root.applyToWorkspace("current", preset)
-  }
-
-  function setPresetEverywhere(name) {
-    root.runHelper(["preset", String(name)])
+  // Manually advance the shape variant for however many windows are on the
+  // focused workspace right now (same action as the SUPER+SHIFT+J keybind).
+  function cycleVariant() {
+    root.runHelper(["cyclevariant"])
   }
 
   function releaseWorkspace(workspace) {
@@ -99,9 +92,8 @@ BarWidget {
     root.runHelper(["release", ws])
   }
 
-  function setDefault(preset) {
-    if (preset === undefined || preset === "") root.runHelper(["default"])
-    else root.runHelper(["default", String(preset)])
+  function setDefault() {
+    root.runHelper(["default"])
   }
 
   // After a Hyprland config reload the runtime registration is gone; this puts
@@ -156,7 +148,7 @@ BarWidget {
           var data = JSON.parse(text || "{}")
           if (data.workspace !== undefined) root.workspaceId = Number(data.workspace) || 0
           if (data.layout) root.layout = String(data.layout)
-          if (data.preset) root.preset = String(data.preset)
+          if (data.shape) root.shape = data.shape
           if (data.error) root.lastError = String(data.error)
         } catch (e) {
           root.logEvent("status-parse-failed", String(e))
@@ -192,7 +184,7 @@ BarWidget {
             root.lastError = ""
             if (data.workspace !== undefined) root.workspaceId = Number(data.workspace) || root.workspaceId
             if (data.layout) root.layout = String(data.layout)
-            if (data.preset) root.preset = String(data.preset)
+            if (data.shape) root.shape = data.shape
             root.logEvent("action-ok", String(data.note || ""))
           }
         }
@@ -251,7 +243,7 @@ BarWidget {
     labelVisible: !root.vertical
     tooltipText: root.lastError !== ""
       ? "Centre split — " + root.lastError
-      : "Centre split — " + Model.labelFor(root.preset)
+      : "Centre split — " + Model.shapeSummary(root.shape)
     horizontalMargin: 8.75
     verticalPadding: 8.75
     onPressed: function (b) {
@@ -271,12 +263,14 @@ BarWidget {
         ctx.strokeStyle = fg
         ctx.fillStyle = Qt.rgba(fg.r, fg.g, fg.b, 0.35)
         ctx.lineWidth = 1
+        // No fixed preset list any more: draw a generic N-up thumbnail from
+        // the bucket (window count), which is all the widget actually knows.
+        var n = Math.max(1, Number(root.shape && root.shape.bucket) || 1)
         var gap = 1.5
         var x = 0.5
-        var widths = Model.presetById(root.preset).slots
-        var inner = width - 1 - gap * (widths.length - 1)
-        for (var i = 0; i < widths.length; i++) {
-          var w = inner * widths[i]
+        var inner = width - 1 - gap * (n - 1)
+        var w = inner / n
+        for (var i = 0; i < n; i++) {
           ctx.fillRect(x, 0.5, w, height - 1)
           ctx.strokeRect(x, 0.5, w, height - 1)
           x += w + gap

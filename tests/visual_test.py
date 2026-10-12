@@ -1,19 +1,26 @@
 #!/usr/bin/env python3
 """Live geometry proof for the Centre Split plugin.
 
-Opens real windows on a scratch Hyprland workspace, applies a preset through the
-plugin's own helper, measures where Hyprland actually put the windows, and checks
-the result against the shape that preset promises. Optionally saves a screenshot
-per case so the result can be eyeballed as well as measured.
+Opens real windows on a scratch Hyprland workspace, applies the current
+window-count-driven shape through the plugin's own helper, cycles to each
+variant for that count with `cyclevariant`, measures where Hyprland actually
+put the windows, and checks the result against the geometry layouts.lua's
+M.SHAPES promises for that bucket/variant. Optionally saves a screenshot per
+variant so the result can be eyeballed as well as measured.
 
-    tests/visual_test.py                 # every case, no screenshots
-    tests/visual_test.py --shots         # also write tests/screenshots/*.png
-    tests/visual_test.py --case qhq-3    # just one case
-    tests/visual_test.py --keep-open     # leave the windows up for a look
+There is no fixed named-preset list any more (qhq/even/thirds/halves are
+gone): the shape is chosen by window count and rotates through variants.
+This harness mirrors that -- it drives `apply` + `cyclevariant`, the same
+calls the panel and SUPER+SHIFT+J make, not a removed `apply shape <name>`.
 
-The focused workspace is saved at the start and restored at the end, the scratch
-workspace is released back to dwindle, and the spawned windows are killed.
-Only hyprctl, foot (test windows) and grim (screenshots) are used.
+    tests/visual_test.py                   # every bucket's variants, no screenshots
+    tests/visual_test.py --shots           # also write tests/screenshots/*.png
+    tests/visual_test.py --bucket 2        # just the 2-window variants
+    tests/visual_test.py --keep-open       # leave the windows up for a look
+
+The focused workspace is saved at the start and restored at the end, the
+scratch workspace is released back to dwindle, and the spawned windows are
+killed. Only hyprctl, foot (test windows) and grim (screenshots) are used.
 """
 
 from __future__ import annotations
@@ -33,84 +40,46 @@ SHOT_DIR = REPO / "tests" / "screenshots"
 APP_ID = "cs-visual-test"
 LAYOUT = "lua:centre-split"
 
-# Slot widths per preset, matching layouts.lua.
-SLOTS = {
-    "qhq": [0.25, 0.50, 0.25],
-    "even": [0.50, 0.50],
-    "thirds": [1 / 3, 1 / 3, 1 / 3],
-    "halves": [0.50, 0.50],
+# Mirrors layouts.lua's M.SHAPES. Keep these two tables in lockstep: this is
+# the live-geometry proof for that module, so a silent drift here would make
+# a real regression in Lua look like a passing test.
+SHAPES: dict[int, list[dict]] = {
+    1: [
+        {"name": "fullscreen", "slots": [1.0], "fill": "order"},
+    ],
+    2: [
+        {"name": "even", "slots": [0.5, 0.5], "fill": "order"},
+        {"name": "one-third-two-thirds", "slots": [1 / 3, 2 / 3], "fill": "order"},
+        {"name": "two-thirds-one-third", "slots": [2 / 3, 1 / 3], "fill": "order"},
+        {"name": "half-horizontal", "slots": [0.5, 0.5], "fill": "order", "orientation": "rows"},
+    ],
+    3: [
+        {"name": "thirds", "slots": [1 / 3, 1 / 3, 1 / 3], "fill": "order"},
+        {
+            "name": "two-thirds-stack",
+            "slots": [2 / 3, 1 / 3],
+            "fill": "widest",
+            "extra": 2,
+            "keep_place": True,
+        },
+    ],
+    4: [
+        {"name": "square", "slots": [0.5, 0.5], "fill": "distribute"},
+        {
+            "name": "two-thirds-stack",
+            "slots": [2 / 3, 1 / 3],
+            "fill": "widest",
+            "extra": 2,
+            "keep_place": True,
+        },
+    ],
 }
 
-# Each expectation is (slot index, row index, rows in that slot) in window
-# creation order: the order the layout fills slots in.
-CASES = [
-    {
-        "name": "qhq-3",
-        "preset": "qhq",
-        "windows": 3,
-        "why": "the headline shape: first window takes the centre half",
-        "expect": [(1, 0, 1), (0, 0, 1), (2, 0, 1)],
-    },
-    {
-        "name": "qhq-1",
-        "preset": "qhq",
-        "windows": 1,
-        "why": "a lone window keeps the centre half instead of filling the screen",
-        "expect": [(1, 0, 1)],
-    },
-    {
-        "name": "qhq-2",
-        "preset": "qhq",
-        "windows": 2,
-        "why": "centre half first, then the left quarter",
-        "expect": [(1, 0, 1), (0, 0, 1)],
-    },
-    {
-        "name": "qhq-4",
-        "preset": "qhq",
-        "windows": 4,
-        "why": "a fourth window stacks inside the centre half",
-        "expect": [(1, 0, 2), (0, 0, 1), (2, 0, 1), (1, 1, 2)],
-    },
-    {
-        "name": "even-2",
-        "preset": "even",
-        "windows": 2,
-        "why": "two equal columns",
-        "expect": [(0, 0, 1), (1, 0, 1)],
-    },
-    {
-        "name": "thirds-3",
-        "preset": "thirds",
-        "windows": 3,
-        "why": "three equal columns",
-        "expect": [(0, 0, 1), (1, 0, 1), (2, 0, 1)],
-    },
-    {
-        "name": "halves-2",
-        "preset": "halves",
-        "windows": 2,
-        "why": "plain 50/50",
-        "expect": [(0, 0, 1), (1, 0, 1)],
-    },
-    {
-        "name": "resplit-after-release",
-        "preset": "qhq",
-        "windows": 4,
-        "why": "splitting again a workspace that had the split, was handed back, and kept its windows",
-        "pre": [["apply", "<ws>", "qhq"], ["release", "<ws>"]],
-        "expect": [(1, 0, 2), (0, 0, 1), (2, 0, 1), (1, 1, 2)],
-    },
-    {
-        "name": "switch-shape-live",
-        "preset": "qhq",
-        "expect_preset": "thirds",
-        "windows": 3,
-        "why": "switching the shape re-tiles every window already on a split workspace",
-        "switch": [["preset", "thirds"]],
-        "expect": [(0, 0, 1), (1, 0, 1), (2, 0, 1)],
-    },
-]
+
+def bucket_for(n: int) -> int:
+    if n <= 0:
+        return 0
+    return min(n, 4)
 
 
 class Failure(Exception):
@@ -223,18 +192,50 @@ def move_to_workspace(ws: int, found: list[dict]) -> None:
 
 def run_apply(*args: str) -> dict:
     result = subprocess.run([str(APPLY), *args], capture_output=True, text=True)
-    payload = {}
-    for line in result.stdout.splitlines():
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                pass
+    payload: dict = {}
+    # apply's JSON reply is pretty-printed (spans multiple lines), so scan
+    # from each "{" at column 0 to find the first value that actually
+    # parses, rather than assuming any single line is a complete object.
+    stdout = result.stdout
+    start = 0
+    while True:
+        start = stdout.find("{", start)
+        if start == -1:
+            break
+        try:
+            candidate, _ = json.JSONDecoder().raw_decode(stdout, start)
+            payload = candidate
+            break
+        except json.JSONDecodeError:
+            start += 1
     if result.returncode != 0 and not payload.get("error"):
         payload = {"error": f"helper exited {result.returncode}: {result.stderr.strip()}"}
     payload["_exit"] = result.returncode
     return payload
+
+
+def set_variant_directly(bucket: int, target_index: int) -> None:
+    """Jump straight to a variant via the `setvariant` layout_msg, dispatched
+    synchronously through hyprctl -- bypassing `apply cyclevariant` + the
+    saved-state JSON file entirely.
+
+    `apply status`'s reported variant is read from a file written as a
+    side effect of a previous `layout_msg`; polling it to decide whether to
+    send ANOTHER message is inherently racy against Hyprland's own
+    recalculation when two buckets' window counts change back-to-back in
+    the same test run (confirmed live: running every bucket in one process
+    intermittently read a stale variant number for the FIRST case of a
+    bucket, even though the geometry itself was always correct for
+    whatever variant was actually active). `setvariant` sidesteps all of
+    that: one dispatch, one recalculation, done.
+    """
+    result = subprocess.run(
+        ["hyprctl", "dispatch", f'hl.dsp.layout("setvariant {bucket} {target_index}")'],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise Failure(f"setvariant {bucket} {target_index} failed: {result.stderr.strip()}")
+    time.sleep(0.6)
 
 
 def dismiss_notifications() -> None:
@@ -261,171 +262,192 @@ def screenshot(monitor: dict, path: Path) -> str:
     return ""
 
 
-def check_case(case: dict, scratch_ws: int, shots: bool) -> tuple[bool, list[str], dict]:
+def expected_groups(spec: dict, n: int) -> list[list[int]]:
+    """Mirror layouts.lua's M.place grouping: which window indices (1-based,
+    creation order) land in which slot, for `n` windows under this shape.
+    Returns one list of window indices per slot.
+    """
+    slot_count = len(spec["slots"])
+    groups: list[list[int]] = [[] for _ in range(slot_count)]
+
+    if spec.get("fill") == "distribute":
+        for i in range(1, n + 1):
+            slot = (i - 1) % slot_count
+            groups[slot].append(i)
+        return groups
+
+    order = list(range(slot_count))
+    if spec.get("fill") == "widest":
+        order.sort(key=lambda idx: (-spec["slots"][idx], idx))
+
+    if n >= slot_count:
+        for slot_pos in range(slot_count):
+            groups[order[slot_pos]].append(slot_pos + 1)
+        extra_slot = spec.get("extra", slot_count + 1) - 1
+        if extra_slot < 0 or extra_slot >= slot_count:
+            extra_slot = slot_count - 1
+        for i in range(slot_count + 1, n + 1):
+            groups[extra_slot].append(i)
+    elif spec.get("keep_place"):
+        for slot_pos in range(n):
+            groups[order[slot_pos]].append(slot_pos + 1)
+    else:
+        # rescale: fewer windows than slots, no keep_place -- each window
+        # gets its own proportionally-rescaled slot (not exercised by any
+        # current SHAPES entry, but mirrored for completeness).
+        for i in range(1, n + 1):
+            groups[i - 1].append(i)
+
+    return groups
+
+
+def expected_geometry(spec: dict, n: int, ux: int, uy: int, uw: int, uh: int):
+    """Mirror layouts.lua's M.place geometry for `n` windows under `spec`,
+    within the usable area. Returns {window_index: (x, y, w, h)}.
+    """
+    groups = expected_groups(spec, n)
+    slot_count = len(spec["slots"])
+
+    if n < slot_count and not spec.get("keep_place") and spec.get("fill") != "distribute":
+        total = sum(spec["slots"][:n])
+        widths = [f / total for f in spec["slots"][:n]] if total > 0 else [1 / n] * n
+    else:
+        widths = spec["slots"]
+
+    ranges = []
+    x = 0.0
+    for w in widths:
+        ranges.append((x, x + w))
+        x += w
+
+    out: dict[int, tuple[float, float, float, float]] = {}
+    rows = spec.get("orientation") == "rows"
+    for slot_pos in range(min(slot_count, len(ranges))):
+        members = groups[slot_pos]
+        if not members:
+            continue
+        r0, r1 = ranges[slot_pos]
+        if rows:
+            slot_y0, slot_y1 = uy + uh * r0, uy + uh * r1
+            slot_h = slot_y1 - slot_y0
+            count = len(members)
+            each_w = uw / count
+            for pos, win in enumerate(members):
+                out[win] = (ux + pos * each_w, slot_y0, each_w, slot_h)
+        else:
+            slot_x0, slot_x1 = ux + uw * r0, ux + uw * r1
+            slot_w = slot_x1 - slot_x0
+            count = len(members)
+            each_h = uh / count
+            for pos, win in enumerate(members):
+                out[win] = (slot_x0, uy + pos * each_h, slot_w, each_h)
+    return out
+
+
+def check_variant(bucket: int, variant_idx: int, scratch_ws: int, shots: bool,
+                   procs: list[subprocess.Popen]) -> tuple[bool, list[str], dict]:
+    spec = SHAPES[bucket][variant_idx - 1]
+    n = bucket if bucket < 4 else bucket  # the 4-bucket cases here always use exactly 4
     notes: list[str] = []
     failures: list[str] = []
-    procs: list[subprocess.Popen] = []
 
+    set_variant_directly(bucket, variant_idx)
+    time.sleep(0.6)
+
+    workspace = next((w for w in hyprctl_json("workspaces", "-j") if w["id"] == scratch_ws), None)
+    if workspace is None:
+        return False, ["scratch workspace disappeared"], {}
+    if workspace.get("tiledLayout") != LAYOUT:
+        failures.append(f"workspace layout is {workspace.get('tiledLayout')!r}, expected {LAYOUT!r}")
+
+    found = clients()
+    if len(found) != n:
+        failures.append(f"{len(found)} windows on the workspace, expected {n}")
+        return False, failures, {}
+
+    monitor = monitor_for_client(found[0])
+    ux, uy, uw, uh = usable_area(monitor)
+    tol = max(10.0, 0.03 * uw)
+
+    by_title = {c.get("title", ""): c for c in found}
+    expected = expected_geometry(spec, n, ux, uy, uw, uh)
+
+    measurements = []
+    for index in range(1, n + 1):
+        client = by_title.get(f"CS-VIS-{index}")
+        if client is None:
+            failures.append(f"window CS-VIS-{index} is missing")
+            continue
+        cx, cy = client["at"]
+        cw, ch = client["size"]
+        want_x, want_y, want_w, want_h = expected.get(index, (0, 0, 0, 0))
+
+        measurements.append({
+            "window": f"CS-VIS-{index}", "x": cx, "y": cy, "w": cw, "h": ch,
+            "want_x": round(want_x, 1), "want_y": round(want_y, 1),
+            "want_w": round(want_w, 1), "want_h": round(want_h, 1),
+        })
+
+        if abs(cw - want_w) > tol:
+            failures.append(f"CS-VIS-{index}: width {cw} vs expected {want_w:.0f} (±{tol:.0f})")
+        if abs(cx - want_x) > tol:
+            failures.append(f"CS-VIS-{index}: x {cx} vs expected {want_x:.0f} (±{tol:.0f})")
+        if abs(ch - want_h) > tol:
+            failures.append(f"CS-VIS-{index}: height {ch} vs expected {want_h:.0f} (±{tol:.0f})")
+        if abs(cy - want_y) > tol:
+            failures.append(f"CS-VIS-{index}: y {cy} vs expected {want_y:.0f} (±{tol:.0f})")
+
+    shot_path = ""
+    if shots:
+        shot_path = str(SHOT_DIR / f"bucket{bucket}-variant{variant_idx}-{spec['name']}.png")
+        error = screenshot(monitor, Path(shot_path))
+        if error:
+            failures.append(error)
+            shot_path = ""
+
+    return (not failures), failures, {
+        "measurements": measurements, "notes": notes, "screenshot": shot_path,
+        "usable": {"x": ux, "y": uy, "w": uw, "h": uh},
+    }
+
+
+def run_bucket(bucket: int, scratch_ws: int, shots: bool) -> list[dict]:
+    n = bucket
+    procs: list[subprocess.Popen] = []
+    results = []
     try:
         focus_workspace(scratch_ws)
-        for i in range(case["windows"]):
+        for i in range(n):
             procs.append(spawn_window(i + 1))
             time.sleep(0.45)
-
-        found = wait_for_windows(case["windows"])
+        found = wait_for_windows(n)
         move_to_workspace(scratch_ws, found)
 
-        def step(args: list[str]) -> dict:
-            return run_apply(*[str(scratch_ws) if a == "<ws>" else a for a in args])
-
-        # Anything the case needs to happen to the workspace before the shape it
-        # is checking: an earlier split, a release, and so on.
-        for args in case.get("pre", []):
-            payload = step(args)
-            if payload.get("error"):
-                failures.append(f"pre-step {' '.join(args)}: {payload['error']}")
-            time.sleep(0.9)
-
-        # Apply the preset through the plugin's own helper.
-        payload = run_apply("apply", str(scratch_ws), case["preset"])
+        payload = run_apply("apply", str(scratch_ws))
         if payload.get("error"):
-            failures.append(f"helper error: {payload['error']}")
+            return [{"case": f"bucket{bucket}-apply", "ok": False,
+                     "failures": [f"helper error: {payload['error']}"], "detail": {}}]
         time.sleep(1.2)
 
-        # Switching the shape must move every window on the workspace, not just
-        # the next one to open.
-        if case.get("switch"):
-            before = {c["title"]: (tuple(c["at"]), tuple(c["size"])) for c in clients()}
-            for args in case["switch"]:
-                payload = step(args)
-                if payload.get("error"):
-                    failures.append(f"switch-step {' '.join(args)}: {payload['error']}")
-            time.sleep(1.5)
-            after = {c["title"]: (tuple(c["at"]), tuple(c["size"])) for c in clients()}
-            stale = [t for t in before if t in after and before[t] == after[t]]
-            if stale:
-                failures.append(
-                    f"still at their pre-switch geometry after the shape changed: {', '.join(sorted(stale))}"
+        for variant_idx in range(1, len(SHAPES[bucket]) + 1):
+            name = f"bucket{bucket}-variant{variant_idx}-{SHAPES[bucket][variant_idx - 1]['name']}"
+            print(f"▶ {name} ({n} window(s))")
+            try:
+                ok, failures, detail = check_variant(bucket, variant_idx, scratch_ws, shots, procs)
+            except Failure as error:
+                ok, failures, detail = False, [str(error)], {}
+            for m in detail.get("measurements", []):
+                print(
+                    "    {window:<10} at ({x:>5},{y:>5}) {w:>5}x{h:<5} | "
+                    "want x={want_x:>7} y={want_y:>6} w={want_w:>7} h={want_h:>6}".format(**m)
                 )
-
-        workspace = next(
-            (w for w in hyprctl_json("workspaces", "-j") if w["id"] == scratch_ws), None
-        )
-        if workspace is None:
-            failures.append("scratch workspace disappeared")
-            return False, failures, {}
-        if workspace.get("tiledLayout") != LAYOUT:
-            failures.append(
-                f"workspace layout is {workspace.get('tiledLayout')!r}, expected {LAYOUT!r}"
-            )
-
-        found = clients()
-        if len(found) != case["windows"]:
-            failures.append(f"{len(found)} windows on the workspace, expected {case['windows']}")
-            return False, failures, {}
-
-        monitor = monitor_for_client(found[0])
-        ux, uy, uw, uh = usable_area(monitor)
-        tol = max(10.0, 0.025 * uw)
-
-        # Hyprland hands windows back without a creation marker, so pair them
-        # with the expectation list by title (CS-VIS-<n>).
-        by_title = {c.get("title", ""): c for c in found}
-        expected_preset = case.get("expect_preset", case["preset"])
-        slots = SLOTS[expected_preset]
-
-        # Slot x-ranges and, inside a slot, the y-ranges of its stacked rows.
-        slot_x = []
-        x = ux
-        for frac in slots:
-            width = uw * frac
-            slot_x.append((x, x + width))
-            x += width
-
-        rows_in_slot: dict[int, int] = {}
-        for slot, _row, rows in case["expect"]:
-            rows_in_slot[slot] = max(rows_in_slot.get(slot, 1), rows)
-
-        measurements = []
-        for index, (slot, row, rows) in enumerate(case["expect"], start=1):
-            client = by_title.get(f"CS-VIS-{index}")
-            if client is None:
-                failures.append(f"window CS-VIS-{index} is missing")
-                continue
-            cx, cy = client["at"]
-            cw, ch = client["size"]
-            want_x0, want_x1 = slot_x[slot]
-            want_w = want_x1 - want_x0
-            want_y = uy + (uh * row / rows)
-            want_h = uh / rows
-
-            measurements.append(
-                {
-                    "window": f"CS-VIS-{index}",
-                    "slot": slot,
-                    "row": f"{row + 1}/{rows}",
-                    "x": cx,
-                    "y": cy,
-                    "w": cw,
-                    "h": ch,
-                    "want_x": round(want_x0, 1),
-                    "want_w": round(want_w, 1),
-                    "want_y": round(want_y, 1),
-                    "want_h": round(want_h, 1),
-                }
-            )
-
-            if abs(cw - want_w) > tol:
-                failures.append(
-                    f"CS-VIS-{index}: width {cw} vs expected {want_w:.0f} (±{tol:.0f})"
-                )
-            if abs(cx - want_x0) > tol:
-                failures.append(
-                    f"CS-VIS-{index}: x {cx} vs expected {want_x0:.0f} (±{tol:.0f})"
-                )
-            if abs(ch - want_h) > tol:
-                failures.append(
-                    f"CS-VIS-{index}: height {ch} vs expected {want_h:.0f} (±{tol:.0f})"
-                )
-            if abs(cy - want_y) > tol:
-                failures.append(f"CS-VIS-{index}: y {cy} vs expected {want_y:.0f} (±{tol:.0f})")
-
-        # The crisp, human-meaningful check for the headline preset: the widest
-        # window sits in the middle of the screen, between the two narrower ones.
-        if expected_preset == "qhq" and case["windows"] >= 3:
-            ordered = sorted(found, key=lambda c: c["at"][0])
-            centre_window = ordered[1]
-            widest = max(found, key=lambda c: c["size"][0])
-            screen_centre = ux + uw / 2
-            window_centre = centre_window["at"][0] + centre_window["size"][0] / 2
-            if centre_window["title"] != widest["title"]:
-                failures.append(
-                    f"widest window is {widest['title']}, not the middle one {centre_window['title']}"
-                )
-            if abs(window_centre - screen_centre) > tol:
-                failures.append(
-                    f"middle window centre {window_centre:.0f} vs screen centre {screen_centre:.0f}"
-                )
-            notes.append(
-                f"middle window {centre_window['title']} is widest "
-                f"({centre_window['size'][0]}px) and centred "
-                f"({abs(window_centre - screen_centre):.0f}px off)"
-            )
-
-        shot_path = ""
-        if shots:
-            shot_path = str(SHOT_DIR / f"{case['name']}.png")
-            error = screenshot(monitor, Path(shot_path))
-            if error:
-                failures.append(error)
-                shot_path = ""
-
-        return (not failures), failures, {
-            "measurements": measurements,
-            "notes": notes,
-            "screenshot": shot_path,
-            "usable": {"x": ux, "y": uy, "w": uw, "h": uh},
-        }
+            if detail.get("screenshot"):
+                print(f"    · screenshot {detail['screenshot']}")
+            for f in failures:
+                print(f"    ✗ {f}")
+            print(f"  {'PASS' if ok else 'FAIL'}\n")
+            results.append({"case": name, "ok": ok, "failures": failures, "detail": detail})
+        return results
     finally:
         if not KEEP_OPEN:
             kill_windows(procs)
@@ -435,16 +457,17 @@ def check_case(case: dict, scratch_ws: int, shots: bool) -> tuple[bool, list[str
 def preflight(scratch_ws: int, allow_reclaim: bool) -> bool:
     """Confirm the layout really resolves before spending time on the cases.
 
-    Hyprland 0.56.2 resolves custom layout names by first-registered, so a Lua
-    layout left behind by an earlier experiment (or another plugin) silently
-    wins. Better to find that out here, with one window, than in every case.
+    Hyprland 0.56.2 resolves custom layout names by first-registered, so a
+    Lua layout left behind by an earlier experiment (or another plugin)
+    silently wins. Better to find that out here, with one window, than in
+    every case.
     """
     procs: list[subprocess.Popen] = []
     try:
         focus_workspace(scratch_ws)
         procs.append(spawn_window(999))
         wait_for_windows(1)
-        payload = run_apply("apply", str(scratch_ws), "qhq")
+        payload = run_apply("apply", str(scratch_ws))
         error = payload.get("error", "")
         if error and "did not resolve" in error and allow_reclaim:
             print(f"! {error}\n  clearing the foreign registration and retrying (apply reclaim)\n")
@@ -453,7 +476,7 @@ def preflight(scratch_ws: int, allow_reclaim: bool) -> bool:
                 print(f"visual_test: reclaim failed: {reclaimed['error']}", file=sys.stderr)
                 return False
             time.sleep(2.0)
-            payload = run_apply("apply", str(scratch_ws), "qhq")
+            payload = run_apply("apply", str(scratch_ws))
             error = payload.get("error", "")
         if error:
             print(f"visual_test: {error}", file=sys.stderr)
@@ -467,8 +490,9 @@ def preflight(scratch_ws: int, allow_reclaim: bool) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--shots", action="store_true", help="save a screenshot per case")
-    parser.add_argument("--case", action="append", help="run only this case (repeatable)")
+    parser.add_argument("--shots", action="store_true", help="save a screenshot per variant")
+    parser.add_argument("--bucket", type=int, action="append",
+                         help="run only this window-count bucket (1-4, repeatable)")
     parser.add_argument("--keep-open", action="store_true", help="leave the test windows open")
     parser.add_argument("--workspace", type=int, default=90, help="scratch workspace id")
     parser.add_argument("--json", action="store_true", help="print results as JSON")
@@ -490,16 +514,13 @@ def main() -> int:
         print("visual_test: grim is required for --shots", file=sys.stderr)
         return 2
 
-    cases = CASES
-    if args.case:
-        wanted = set(args.case)
-        cases = [c for c in CASES if c["name"] in wanted]
-        if not cases:
-            print(f"visual_test: no such case; known: {', '.join(c['name'] for c in CASES)}", file=sys.stderr)
+    buckets = args.bucket if args.bucket else [1, 2, 3, 4]
+    for b in buckets:
+        if b not in SHAPES:
+            print(f"visual_test: no such bucket; known: {', '.join(str(k) for k in SHAPES)}", file=sys.stderr)
             return 2
 
     original_ws = active_workspace()
-    original_preset = run_apply("status").get("preset", "qhq")
     results = []
     print(f"Centre Split live check — scratch workspace {args.workspace}, origin workspace {original_ws}")
     print(f"hyprctl reports {len(hyprctl_json('monitors', '-j'))} monitor(s)\n")
@@ -508,27 +529,8 @@ def main() -> int:
         if not preflight(args.workspace, allow_reclaim=not args.no_reclaim):
             return 2
 
-        for case in cases:
-            print(f"▶ {case['name']}  ({case['preset']}, {case['windows']} window(s)) — {case['why']}")
-            try:
-                ok, failures, detail = check_case(case, args.workspace, args.shots)
-            except Failure as error:
-                ok, failures, detail = False, [str(error)], {}
-
-            for measurement in detail.get("measurements", []):
-                print(
-                    "    {window:<10} slot {slot} row {row:<3} "
-                    "at ({x:>5},{y:>5}) {w:>5}x{h:<5} | want x={want_x:>7} w={want_w:>7} "
-                    "y={want_y:>6} h={want_h:>6}".format(**measurement)
-                )
-            for note in detail.get("notes", []):
-                print(f"    ✓ {note}")
-            if detail.get("screenshot"):
-                print(f"    · screenshot {detail['screenshot']}")
-            for failure in failures:
-                print(f"    ✗ {failure}")
-            print(f"  {'PASS' if ok else 'FAIL'}\n")
-            results.append({"case": case["name"], "ok": ok, "failures": failures, "detail": detail})
+        for bucket in buckets:
+            results.extend(run_bucket(bucket, args.workspace, args.shots))
     finally:
         if not KEEP_OPEN:
             run_apply("release", str(args.workspace))
@@ -536,8 +538,6 @@ def main() -> int:
                 focus_workspace(original_ws)
             except Failure:
                 pass
-            if original_preset:
-                run_apply("preset", original_preset)
 
     passed = sum(1 for r in results if r["ok"])
     print(f"{passed}/{len(results)} cases passed")
