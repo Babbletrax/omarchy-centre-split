@@ -182,6 +182,28 @@ for _, name in ipairs(plugin.PRESET_NAMES) do
   check("preset " .. name .. " slots sum to 1", almost(sum, 1, 0.0001), tostring(sum))
 end
 
+-- ---- togglesplit (SUPER+J) cycles presets in a defined order instead of
+-- being rejected. M.CYCLE_ORDER is qhq -> even -> thirds -> halves -> qhq.
+do
+  plugin.set_preset("qhq")
+  local ctx = mock_ctx(1)
+  local expect = { "even", "thirds", "halves", "qhq" }
+  for _, want in ipairs(expect) do
+    local ok = plugin.handle_message(ctx, "togglesplit")
+    check("togglesplit accepted", ok == true, tostring(ok))
+    check("togglesplit cycles to " .. want, plugin.preset() == want, plugin.preset())
+  end
+end
+
+-- ---- A genuinely unknown message is still rejected (not silently accepted).
+do
+  plugin.set_preset("qhq")
+  local ctx = mock_ctx(1)
+  local result = plugin.handle_message(ctx, "not-a-real-message")
+  check("unknown message rejected", type(result) == "string", tostring(result))
+  check("preset unchanged by unknown message", plugin.preset() == "qhq", plugin.preset())
+end
+
 if fails > 0 then
   print(string.format("%d check(s) failed", fails))
   os.exit(1)

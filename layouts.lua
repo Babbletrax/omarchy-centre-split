@@ -58,6 +58,21 @@ M.PRESETS = {
 
 M.DEFAULT_PRESET = "qhq"
 
+-- Cycle order for togglesplit (SUPER+J). Deliberately separate from
+-- PRESET_NAMES (which is alphabetised for display/validation) so the cycle
+-- can be the shape progression users actually want: qhq -> even -> thirds ->
+-- halves -> back to qhq.
+M.CYCLE_ORDER = { "qhq", "even", "thirds", "halves" }
+
+function M.next_preset(current)
+  for i, name in ipairs(M.CYCLE_ORDER) do
+    if name == current then
+      return M.CYCLE_ORDER[(i % #M.CYCLE_ORDER) + 1]
+    end
+  end
+  return M.CYCLE_ORDER[1]
+end
+
 M.PRESET_NAMES = {}
 do
   local names = {}
@@ -261,11 +276,23 @@ local function handle_message(ctx, msg)
     -- Handy from a keybinding: forces the layout to run again.
     return true
   end
+  if command == "togglesplit" then
+    -- SUPER+J's default binding. togglesplit is a dwindle-only concept (split
+    -- orientation) this layout has no equivalent for; instead of rejecting it
+    -- outright, cycle to the next preset in M.CYCLE_ORDER so the keybind does
+    -- something useful on a centre-split workspace too.
+    state.preset = M.next_preset(state.preset)
+    return true
+  end
   local rejection = "centre-split: expected " .. table.concat(M.PRESET_NAMES, ", ") .. ", or preset <name>"
   local reason = (text == "" and rejection) or ("\"" .. text .. "\" not supported here \226\128\148 " .. rejection)
   notify_reject(reason)
   return rejection
 end
+
+-- Exposed for tests: handle_message is otherwise local so the compositor
+-- call path is unambiguous.
+M.handle_message = handle_message
 
 -- Idempotent: Hyprland rejects a repeat registration with a Lua error, and this
 -- file is loaded again on every shell start, Hyprland reload, and apply.
