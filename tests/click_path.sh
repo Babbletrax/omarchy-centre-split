@@ -42,7 +42,7 @@ layout_of() {
 state_workspaces() {
   "$APPLY" status 2>/dev/null | jq -r '.state.workspaces // {} | keys[]' 2>/dev/null
 }
-# shellcheck disable=SC2329 # invoked by the EXIT trap
+# shellcheck disable=SC2317,SC2329 # invoked by the EXIT trap
 cleanup() {
   for a in $(hyprctl clients -j | jq -r --arg app "$APP" '.[] | select(.class == $app) | .address'); do
     hyprctl dispatch "hl.dsp.window.close({ window = \"address:$a\" })" >/dev/null
