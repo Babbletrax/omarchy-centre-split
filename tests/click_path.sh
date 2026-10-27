@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# pass and fail always succeed, so `cond && pass || fail` is a safe if/else.
+# shellcheck disable=SC2015
 # Click-path test: drive the plugin the way the bar widget does, over IPC, and
 # prove the shape lands on the workspace you are actually looking at.
 #
@@ -24,7 +26,10 @@ APP="cs-click"
 FAILURES=0
 
 pass() { printf '  ok    %s\n' "$1"; }
-fail() { printf '  FAIL  %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
+fail() {
+  printf '  FAIL  %s\n' "$1"
+  FAILURES=$((FAILURES + 1))
+}
 
 geom() { # geometry of this test's windows, sorted left to right
   hyprctl clients -j | jq -r --argjson ws "$WS" --arg app "$APP" \
@@ -37,9 +42,7 @@ layout_of() {
 state_workspaces() {
   "$APPLY" status 2>/dev/null | jq -r '.state.workspaces // {} | keys[]' 2>/dev/null
 }
-ratio_ok() { # <a> <b> -- within 1.5% of each other
-  python3 -c "import sys;a,b=int(sys.argv[1]),int(sys.argv[2]);sys.exit(0 if abs(a-b) <= max(a,b)*0.015 else 1)" "$1" "$2"
-}
+# shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
   for a in $(hyprctl clients -j | jq -r --arg app "$APP" '.[] | select(.class == $app) | .address'); do
     hyprctl dispatch "hl.dsp.window.close({ window = \"address:$a\" })" >/dev/null
@@ -57,7 +60,8 @@ echo "click-path test (workspace $WS, you were on $ORIGINAL_WS)"
 # --- two real windows on the scratch workspace --------------------------------
 # 2 windows exercises the richest variant list (4 shapes), so cyclevariant has
 # the most room to prove it actually moved something.
-hyprctl dispatch "hl.dsp.focus({ workspace = \"$WS\" })" >/dev/null; sleep 0.6
+hyprctl dispatch "hl.dsp.focus({ workspace = \"$WS\" })" >/dev/null
+sleep 0.6
 foot -a "$APP" -T CLICK-1 -e sleep 120 &
 foot -a "$APP" -T CLICK-2 -e sleep 120 &
 sleep 3
@@ -93,12 +97,14 @@ fi
 
 # --- cyclevariant (what the panel's shape button / SUPER+SHIFT+J does) -------
 readarray -t before < <(geom)
-before_w1="${before[0]##* }"; before_w2="${before[1]##* }"
+before_w1="${before[0]##* }"
+before_w2="${before[1]##* }"
 
 omarchy-shell "$ID" shape cyclevariant >/dev/null 2>&1
 sleep 2
 readarray -t after < <(geom)
-after_w1="${after[0]##* }"; after_w2="${after[1]##* }"
+after_w1="${after[0]##* }"
+after_w2="${after[1]##* }"
 
 if [[ "$before_w1 $before_w2" != "$after_w1 $after_w2" ]]; then
   pass "cyclevariant re-tiled the workspace: $before_w1/$before_w2 -> $after_w1/$after_w2"

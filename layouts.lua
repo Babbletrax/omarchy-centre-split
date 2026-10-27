@@ -430,7 +430,8 @@ local function persist_state()
     .. "jq -n --argjson variant '" .. variant_json .. "' --argjson lastcount " .. last_count .. " "
     .. "'{shape: {variant: $variant, last_count: $lastcount}, default: \"\", workspaces: {}}' >\"$tmp\" 2>/dev/null; "
     .. "fi; "
-    .. "if [ -s \"$tmp\" ] && jq -e . \"$tmp\" >/dev/null 2>&1; then mv \"$tmp\" " .. qfile .. "; else rm -f \"$tmp\"; fi"
+    .. "if [ -s \"$tmp\" ] && jq -e . \"$tmp\" >/dev/null 2>&1; then "
+    .. "mv \"$tmp\" " .. qfile .. "; else rm -f \"$tmp\"; fi"
   pcall(os.execute, cmd)
 end
 

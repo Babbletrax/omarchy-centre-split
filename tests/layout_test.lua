@@ -39,7 +39,7 @@ local function mock_ctx(n, w, h)
     area = { x = 0, y = 0, w = w, h = h },
     targets = targets,
   }
-  function ctx:split(box, side, ratio)
+  function ctx.split(_, box, side, ratio)
     if side == "left" then
       return { x = box.x, y = box.y, w = box.w * ratio, h = box.h }
     elseif side == "right" then

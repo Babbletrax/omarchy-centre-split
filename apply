@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# jq filters are single-quoted on purpose; their $vars belong to jq.
+# shellcheck disable=SC2016
 # Centre Split helper: register the plugin's Hyprland layout and drive it.
 #
 # Talks to Hyprland through hyprctl only. Does not edit hyprland.lua, does not
@@ -68,7 +70,8 @@ notify() { # native system notification: notify <urgency> <headline> [body]
 }
 
 fail() { # fail <exit-code> <message>
-  local code="$1"; shift
+  local code="$1"
+  shift
   local message="$*"
   log "ERROR $message"
   jq -n --arg e "$message" '{ok: false, error: $e}'
@@ -115,7 +118,8 @@ state_json() { # never fails: a missing or corrupt file reads as empty state
 }
 
 write_state() { # write_state <jq-filter> [jq args...], applied to current state
-  local filter="$1"; shift
+  local filter="$1"
+  shift
   ensure_config_dir
   local tmp
   tmp="$(mktemp "$CONFIG_DIR/centre-split.XXXXXX.json")"
@@ -216,10 +220,10 @@ window_count() { # window_count <workspace> -- how many windows are on it now
 }
 
 verify_workspace() { # catches a layout name that resolves to something else
-  local ws="$1" want="$2" got attempt
+  local ws="$1" want="$2" got
   # Hyprland settles a workspace rule asynchronously, so poll rather than
   # reading once and racing the compositor.
-  for attempt in 1 2 3 4 5 6 7 8; do
+  for _ in 1 2 3 4 5 6 7 8; do
     got="$(workspace_layout "$ws")"
     if [[ -z $got ]]; then
       VERIFY_NOTE="workspace $ws has no windows yet; the split applies when it opens"
@@ -564,19 +568,34 @@ USAGE
 
 main() {
   require_deps
-  [[ $# -ge 1 ]] || { usage; exit 1; }
+  [[ $# -ge 1 ]] || {
+    usage
+    exit 1
+  }
   case "$1" in
     register) cmd_register ;;
-    apply) shift; cmd_apply "${1:-}" ;;
-    release) shift; cmd_release "${1:-}" ;;
+    apply)
+      shift
+      cmd_apply "${1:-}"
+      ;;
+    release)
+      shift
+      cmd_release "${1:-}"
+      ;;
     cyclevariant) cmd_cyclevariant ;;
     default) cmd_default ;;
     restore) cmd_restore ;;
     reclaim) cmd_reclaim ;;
     status) cmd_status ;;
     doctor) cmd_doctor ;;
-    -h | --help | help) usage; exit 0 ;;
-    *) usage; exit 1 ;;
+    -h | --help | help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
   esac
 }
 

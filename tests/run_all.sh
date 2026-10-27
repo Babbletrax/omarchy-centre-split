@@ -15,7 +15,10 @@ for arg in "$@"; do
   case "$arg" in
     --units) UNITS_ONLY=1 ;;
     --shots) SHOT_ARGS+=(--shots) ;;
-    *) echo "run_all: unknown option '$arg'" >&2; exit 1 ;;
+    *)
+      echo "run_all: unknown option '$arg'" >&2
+      exit 1
+      ;;
   esac
 done
 

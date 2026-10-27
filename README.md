@@ -116,6 +116,8 @@ tests/run_all.sh --units    # no windows opened
 tests/run_all.sh --shots    # also save tests/screenshots/<case>.png
 ```
 
+`scripts/check.sh` runs everything CI runs (GitHub Actions and GitLab): manifest checks, `luac` and luacheck on `layouts.lua`, the geometry unit tests, qmllint, ShellCheck and shfmt, gitleaks, and a scan for private paths and hostnames. It skips tools you don't have; `--strict` fails instead. The live tests below need a running Hyprland and are not run in CI.
+
 `tests/layout_test.lua` runs `layouts.lua` against a mock layout context: slot arithmetic per preset, one/two/three/four windows, stacking, and preset bookkeeping. No compositor needed, so it works over SSH.
 
 `tests/visual_test.py` is the visual proof. It opens real windows on a scratch workspace (default 90), applies each preset through the plugin's own helper, screenshots the result with `grim` when asked, and measures where Hyprland actually put the windows against the fractions that preset promises — width, x, height and y, plus a crisp check that the widest window is the middle one and is centred on the screen. It saves and restores the focused workspace and your saved preset, releases the scratch workspace afterwards, and clears desktop toasts before each screenshot so the image shows the tiling and nothing else. Cases: `qhq-3`, `qhq-1`, `qhq-2`, `qhq-4`, `even-2`, `thirds-3`, `halves-2`, `resplit-after-release` (split a workspace that had the split before and was handed back), `switch-shape-live` (switch shape on a split workspace and require **every** window to move).
@@ -191,6 +193,10 @@ omarchy plugin remove io.github.babbletrax.centre-split
 ```
 
 Then hand any split workspaces back to dwindle (Super+L, or the panel's **Back to dwindle** before removing), and delete `~/.config/omarchy/centre-split.json` if you no longer want the saved choices. The optional `dofile` block can stay — it checks the file exists first — or be deleted.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
